@@ -33,7 +33,7 @@ import {
   formatReset,
 } from "./lib/format";
 
-import codexIcon from "../assets/branding/app/app-icon-macos.png";
+import codexIconBody from "../assets/branding/app/app-icon-master.png";
 
 /*
  * ============================================================
@@ -1067,12 +1067,16 @@ function App() {
         <div
           className="brand"
         >
-          <img
+          <div
             className="brand-mark"
-            src={codexIcon}
-            alt=""
-            aria-hidden="true"
-          />
+          >
+            <img
+              className="brand-icon-body"
+              src={codexIconBody}
+              alt=""
+              aria-hidden="true"
+            />
+          </div>
 
           <div>
             <div

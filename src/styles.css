@@ -36,9 +36,19 @@ button { font: inherit; }
   width: 46px;
   height: 46px;
   flex: 0 0 46px;
-  object-fit: cover;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #fff;
   border-radius: 12px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, .12), 0 7px 18px rgba(0, 0, 0, .10);
+}
+.brand-icon-body {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  display: block;
 }
 .title { font-size: 19px; font-weight: 700; letter-spacing: -.02em; }
 .muted { color: #6e6e73; }
