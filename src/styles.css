@@ -56,11 +56,11 @@ button { font: inherit; }
   object-fit: contain;
   display: block;
   position: absolute;
-  /* Optical centering: the account badge adds visual mass at the lower
-     right, so Apple-style symbol placement is slightly up/left of the
-     geometric center while the white tile remains exactly centered. */
-  left: calc(50% - 7px);
-  top: calc(50% - 3px);
+  /* Strictly center the transparent source canvas in the fixed tile. The
+     source already carries Apple's safety space; applying a second optical
+     offset makes the badge visibly drift left/up at this small size. */
+  left: 50%;
+  top: 50%;
   transform: translate(-50%, -50%);
 }
 .title { font-size: 19px; font-weight: 700; letter-spacing: -.02em; }
