@@ -9,7 +9,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         mpsc,
-        Arc, Mutex, Weak,
+        Arc, Condvar, Mutex, Weak,
     },
     thread,
     time::Duration,
@@ -65,6 +65,8 @@ pub struct CodexRpcClient {
     active_generation: AtomicU64,
 
     reconnecting: AtomicBool,
+    reconnect_wait: Condvar,
+    reconnect_wait_lock: Mutex<bool>,
     shutting_down: AtomicBool,
 
     status: Mutex<ConnectionStatus>,
@@ -82,6 +84,8 @@ impl CodexRpcClient {
             next_generation: AtomicU64::new(1),
             active_generation: AtomicU64::new(0),
             reconnecting: AtomicBool::new(false),
+            reconnect_wait: Condvar::new(),
+            reconnect_wait_lock: Mutex::new(false),
             shutting_down: AtomicBool::new(false),
             status: Mutex::new(ConnectionStatus::default()),
             display_path: Mutex::new(None),
@@ -139,6 +143,39 @@ impl CodexRpcClient {
                 last_error: Some("Connection status lock poisoned".into()),
                 ..ConnectionStatus::default()
             })
+    }
+
+    pub fn reconnect(self: &Arc<Self>) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("Codex RPC client is shutting down".into());
+        }
+
+        let status = self.status();
+
+        if status.phase != "disconnected"
+            && status.phase != "reconnecting"
+        {
+            return Err(format!(
+                "Codex connection is not disconnected (state={})",
+                status.phase
+            ));
+        }
+
+        self.set_status(
+            "reconnecting",
+            status.attempt.max(1),
+            status.last_error,
+            Some(0),
+        );
+
+        if let Ok(mut requested) = self.reconnect_wait_lock.lock() {
+            *requested = true;
+        }
+
+        self.reconnect_wait.notify_all();
+        self.schedule_reconnect();
+
+        Ok(())
     }
 
     pub fn display_path(&self) -> Option<String> {
@@ -689,7 +726,12 @@ impl CodexRpcClient {
                     return;
                 }
 
-                let delay = reconnect_delay(attempt);
+                let forced = client.take_reconnect_request();
+                let delay = if forced {
+                    Duration::ZERO
+                } else {
+                    reconnect_delay(attempt)
+                };
 
                 let last_error = client
                     .status
@@ -709,7 +751,11 @@ impl CodexRpcClient {
                     delay.as_millis()
                 );
 
-                thread::sleep(delay);
+                if !forced && client.wait_for_reconnect(delay) {
+                    println!(
+                        "[Codex RPC] manual reconnect requested"
+                    );
+                }
 
                 if client.shutting_down.load(Ordering::Acquire) {
                     client.reconnecting.store(false, Ordering::Release);
@@ -718,6 +764,7 @@ impl CodexRpcClient {
 
                 match client.establish_connection(attempt) {
                     Ok(()) => {
+                        client.clear_reconnect_request();
                         client.reconnecting.store(
                             false,
                             Ordering::Release,
@@ -807,6 +854,47 @@ impl CodexRpcClient {
             pending.remove(&id);
         }
     }
+
+    fn wait_for_reconnect(
+        &self,
+        delay: Duration,
+    ) -> bool {
+        let Ok(requested) = self.reconnect_wait_lock.lock() else {
+            thread::sleep(delay);
+            return false;
+        };
+
+        let Ok((mut requested, _)) = self
+            .reconnect_wait
+            .wait_timeout_while(
+                requested,
+                delay,
+                |requested| !*requested,
+            )
+        else {
+            return false;
+        };
+
+        let forced = *requested;
+        *requested = false;
+        forced
+    }
+
+    fn take_reconnect_request(&self) -> bool {
+        let Ok(mut requested) = self.reconnect_wait_lock.lock() else {
+            return false;
+        };
+
+        let forced = *requested;
+        *requested = false;
+        forced
+    }
+
+    fn clear_reconnect_request(&self) {
+        if let Ok(mut requested) = self.reconnect_wait_lock.lock() {
+            *requested = false;
+        }
+    }
 }
 
 impl Drop for CodexRpcClient {
@@ -815,6 +903,8 @@ impl Drop for CodexRpcClient {
             true,
             Ordering::Release,
         );
+
+        self.reconnect_wait.notify_all();
 
         self.active_generation.store(
             0,

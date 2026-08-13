@@ -98,7 +98,7 @@ reconnect_codex()
 
 立即打断当前退避等待，主动重连。
 
-不是必须，但体验会明显完整。
+**已完成。** Rust 端通过 `Condvar` 唤醒当前退避线程，`reconnect_codex()` 会立即打断等待并主动开始连接；UI 会显示倒计时和 `Retry now` 按钮。
 
 ---
 

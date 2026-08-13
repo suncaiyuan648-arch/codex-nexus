@@ -794,6 +794,7 @@ Legend:
 * [x] Realtime quota updates
 * [x] Persistent RPC client
 * [x] Automatic reconnection
+* [x] Manual reconnect
 * [x] Windows system tray
 
 ### V0.2 — Desktop Experience
@@ -1407,6 +1408,8 @@ Expected recovery:
 After the new generation becomes ready, the React application should automatically refresh the Codex snapshot.
 
 No manual Refresh click should be required.
+
+If automatic reconnection is waiting in its backoff period, click `Retry now` in the connection card to call `reconnect_codex()` and wake the retry worker immediately.
 
 ---
 

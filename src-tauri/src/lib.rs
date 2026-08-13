@@ -43,6 +43,13 @@ fn get_codex_connection_status(
 }
 
 #[tauri::command]
+fn reconnect_codex(
+    state: State<'_, CodexState>,
+) -> Result<(), String> {
+    state.client.reconnect()
+}
+
+#[tauri::command]
 fn get_codex_snapshot(
     state: State<'_, CodexState>,
 ) -> Result<Value, String> {
@@ -303,7 +310,8 @@ pub fn run() {
         .invoke_handler(
             tauri::generate_handler![
                 get_codex_snapshot,
-                get_codex_connection_status
+                get_codex_connection_status,
+                reconnect_codex
             ],
         )
 

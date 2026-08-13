@@ -324,6 +324,16 @@ function App() {
     string | null
   >(null);
 
+  const [
+    reconnectingManually,
+    setReconnectingManually,
+  ] = useState(false);
+
+  const [
+    retryCountdownMs,
+    setRetryCountdownMs,
+  ] = useState<number | null>(null);
+
   /*
    * ==========================================================
    * Snapshot Refresh
@@ -367,6 +377,32 @@ function App() {
           );
         } finally {
           setLoading(false);
+        }
+      },
+      [],
+    );
+
+  const reconnect =
+    useCallback(
+      async () => {
+        try {
+          setReconnectingManually(true);
+          setError(null);
+
+          await invoke<void>(
+            "reconnect_codex",
+          );
+        } catch (error) {
+          console.error(
+            "[UI] manual reconnect failed:",
+            error,
+          );
+
+          setError(
+            String(error),
+          );
+
+          setReconnectingManually(false);
         }
       },
       [],
@@ -538,6 +574,63 @@ function App() {
       }
     };
   }, [refresh]);
+
+  useEffect(() => {
+    if (
+      connection?.phase
+        === "ready"
+      || connection?.phase
+        === "disconnected"
+    ) {
+      setReconnectingManually(false);
+    }
+  }, [connection?.phase]);
+
+  useEffect(() => {
+    if (
+      connection?.phase
+        !== "reconnecting"
+      || connection.retryInMs
+        === null
+      || connection.retryInMs
+        <= 0
+    ) {
+      setRetryCountdownMs(null);
+      return;
+    }
+
+    const initialMs =
+      connection.retryInMs;
+
+    const startedAt =
+      Date.now();
+
+    const update = () => {
+      setRetryCountdownMs(
+        Math.max(
+          0,
+          initialMs
+            - (Date.now() - startedAt),
+        ),
+      );
+    };
+
+    update();
+
+    const timer =
+      window.setInterval(
+        update,
+        250,
+      );
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [
+    connection?.phase,
+    connection?.retryInMs,
+    connection?.attempt,
+  ]);
 
   /*
    * ==========================================================
@@ -846,12 +939,12 @@ function App() {
 
           case "reconnecting":
             if (
-              connection.retryInMs
+              retryCountdownMs
+                !== null
             ) {
               return (
                 `Reconnecting · retry in ${Math.ceil(
-                  connection
-                    .retryInMs
+                  retryCountdownMs
                   / 1000,
                 )
                 }s`
@@ -868,7 +961,10 @@ function App() {
         }
       },
 
-      [connection],
+      [
+        connection,
+        retryCountdownMs,
+      ],
     );
 
   const connectionReady =
@@ -994,9 +1090,12 @@ function App() {
 
       {
         connection
-          ?.lastError
-          && connection.phase
-          !== "ready"
+          && (
+            connection.phase
+              === "disconnected"
+            || connection.phase
+              === "reconnecting"
+          )
 
           ? (
             <section
@@ -1020,11 +1119,35 @@ function App() {
                   connection.phase
                     === "reconnecting"
 
-                    ? "正在自动重新连接 Codex…"
+                    ? retryCountdownMs
+                      !== null
+                      && retryCountdownMs
+                        > 0
+                      ? `Retrying in ${Math.ceil(
+                        retryCountdownMs
+                        / 1000,
+                      )}s`
+                      : "Retrying…"
 
-                    : "等待重新连接 Codex…"
+                    : "Waiting to reconnect…"
                 }
               </p>
+
+              <button
+                className="refresh"
+                onClick={() => {
+                  void reconnect();
+                }}
+                disabled={
+                  reconnectingManually
+                }
+              >
+                {
+                  reconnectingManually
+                    ? "Retrying…"
+                    : "Retry now"
+                }
+              </button>
             </section>
           )
 
