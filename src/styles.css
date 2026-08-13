@@ -56,11 +56,10 @@ button { font: inherit; }
   object-fit: contain;
   display: block;
   position: absolute;
-  /* Strictly center the transparent source canvas in the fixed tile. The
-     source already carries Apple's safety space; applying a second optical
-     offset makes the badge visibly drift left/up at this small size. */
-  left: 50%;
-  top: 50%;
+  /* Correct the source artwork's own alpha bounds: at 58px the visible
+     master is about 1px right and 2px above the canvas center. */
+  left: calc(50% - 1px);
+  top: calc(50% + 2px);
   transform: translate(-50%, -50%);
 }
 .title { font-size: 19px; font-weight: 700; letter-spacing: -.02em; }
