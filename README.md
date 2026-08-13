@@ -229,6 +229,17 @@ Initializing
 Ready
 ```
 
+### Transport and Account Status
+
+Codex Nexus keeps transport health separate from authentication state. A ready
+Codex App Server can therefore show `Connected` with `Account unavailable`
+instead of incorrectly reporting a disconnected transport.
+
+The client tracks `unknown`, `signedIn`, `signedOut`, and `error` account states.
+When Codex emits `account/updated` after sign-out, sign-in, or account changes,
+Codex Nexus immediately refreshes the account snapshot instead of waiting for
+the periodic usage refresh.
+
 If the process crashes:
 
 ```text

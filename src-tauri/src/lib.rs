@@ -110,15 +110,33 @@ fn get_codex_snapshot(
     let (
         account,
         account_error,
+        account_state,
     ) = match account_result {
-        Ok(value) => (
-            Some(value),
-            None,
-        ),
+        Ok(value) => {
+            let signed_in = value
+                .get("account")
+                .map(|account| !account.is_null())
+                .unwrap_or(false);
+
+            if signed_in {
+                (
+                    Some(value),
+                    None,
+                    "signedIn",
+                )
+            } else {
+                (
+                    Some(value),
+                    None,
+                    "signedOut",
+                )
+            }
+        }
 
         Err(error) => (
             None,
-            Some(error),
+            Some(error.clone()),
+            classify_account_error(&error),
         ),
     };
 
@@ -159,6 +177,9 @@ fn get_codex_snapshot(
         "accountError":
             account_error,
 
+        "accountState":
+            account_state,
+
         "rateLimits":
             rate_limits,
 
@@ -168,6 +189,25 @@ fn get_codex_snapshot(
         "usageError":
             usage_error
     }))
+}
+
+fn classify_account_error(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+
+    if normalized.contains("not logged")
+        || normalized.contains("not authenticated")
+        || normalized.contains("unauthenticated")
+        || normalized.contains("unauthorized")
+        || normalized.contains("auth_required")
+        || normalized.contains("auth required")
+        || normalized.contains("not_logged")
+        || normalized.contains("signed out")
+        || normalized.contains("login required")
+    {
+        "signedOut"
+    } else {
+        "error"
+    }
 }
 
 #[cfg_attr(

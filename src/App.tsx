@@ -15,7 +15,9 @@ import {
 } from "@tauri-apps/api/event";
 
 import type {
+  AccountUpdatedPayload,
   CodexConnectionStatus,
+  CodexAccountState,
   CodexSnapshot,
   DailyUsageBucket,
   RateLimitsUpdatedPayload,
@@ -971,6 +973,77 @@ function App() {
     connection?.phase === "ready";
 
   /*
+   * Codex emits account/updated when authentication or the active
+   * account changes. Re-read the snapshot immediately instead of
+   * waiting for the five-minute usage poll.
+   */
+  useEffect(() => {
+    let disposed = false;
+
+    let unlisten:
+      (() => void)
+      | undefined;
+
+    const setup =
+      async () => {
+        unlisten = await listen<
+          AccountUpdatedPayload
+        >(
+          "codex://account-updated",
+          (event) => {
+            if (disposed) {
+              return;
+            }
+
+            console.log(
+              "[UI] received account update:",
+              event.payload,
+            );
+
+            if (connectionReady) {
+              void refresh();
+            }
+          },
+        );
+      };
+
+    void setup();
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [
+    connectionReady,
+    refresh,
+  ]);
+
+  const accountState:
+    CodexAccountState =
+    snapshot?.accountState
+    ?? "unknown";
+
+  const accountText =
+    useMemo(
+      () => {
+        switch (accountState) {
+          case "signedIn":
+            return "Account signed in";
+
+          case "signedOut":
+            return "Account unavailable";
+
+          case "error":
+            return "Account error";
+
+          default:
+            return "Account status unknown";
+        }
+      },
+      [accountState],
+    );
+
+  /*
    * ==========================================================
    * Render
    * ==========================================================
@@ -1048,6 +1121,12 @@ function App() {
 
                   : ""
               }
+            </div>
+
+            <div
+              className="muted tiny"
+            >
+              {accountText}
             </div>
           </div>
         </div>
@@ -1151,6 +1230,44 @@ function App() {
             </section>
           )
 
+          : null
+      }
+
+      {
+        connectionReady
+          && snapshot
+          && accountState
+            !== "signedIn"
+          ? (
+            <section
+              className="error-card account-card"
+            >
+              <strong>
+                {accountText}
+              </strong>
+
+              <p>
+                {
+                  accountState
+                    === "signedOut"
+                    ? "Codex connected, but no signed-in account is currently available."
+                    : "Codex connected, but account information is currently unavailable."
+                }
+              </p>
+
+              {
+                snapshot.accountError
+                  ? (
+                    <p
+                      className="muted small"
+                    >
+                      {snapshot.accountError}
+                    </p>
+                  )
+                  : null
+              }
+            </section>
+          )
           : null
       }
 

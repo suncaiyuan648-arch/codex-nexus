@@ -66,12 +66,20 @@ export interface AccountReadResult {
   account: CodexAccount | null;
 }
 
+export type CodexAccountState =
+  | "unknown"
+  | "signedIn"
+  | "signedOut"
+  | "error";
+
 export interface CodexSnapshot {
   codexPath: string;
   fetchedAt: number;
 
   account: AccountReadResult  | null;
   accountError: string | null;
+
+  accountState: CodexAccountState;
 
   rateLimits: RateLimitsResult | null;
 
@@ -90,6 +98,13 @@ export type RateLimitBucketUpdate =
 
 export interface RateLimitsUpdatedPayload {
   rateLimits: RateLimitBucketUpdate;
+}
+
+export interface AccountUpdatedPayload {
+  account?: CodexAccount | null;
+  planType?: string | null;
+  email?: string | null;
+  type?: string | null;
 }
 
 export type CodexConnectionPhase =

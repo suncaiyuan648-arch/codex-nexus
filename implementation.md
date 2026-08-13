@@ -169,6 +169,8 @@ notification，会在认证模式变化时发出，并在可用时包含 `planTy
 
 你的 Monitor 可以实时更新，而不是等 5 分钟。
 
+**已完成。** Transport 状态仍由连接生命周期表示；Snapshot 另外返回 `accountState`（`unknown`、`signedIn`、`signedOut`、`error`）。`account/updated` notification 会转发到前端并立即触发账号刷新。
+
 ---
 
 ## 第二优先级：把它真正做成“监控器”
@@ -709,7 +711,7 @@ settings
   ↓
 ① Snapshot 三 RPC 并发化 ✅
   ↓
-② account/updated 实时账号变化
+② account/updated 实时账号变化 ✅
   ↓
 ③ Tray 显示当前额度
   ↓
@@ -741,6 +743,6 @@ reset credit
 
 都可以算 V1.5/V2。
 
-Snapshot 三 RPC 并发化已经完成。下一步最适合做 **`account/updated` 实时账号变化**；完成后我们就可以停止折腾 RPC 架构，把精力转到 Tray、通知和 UI 上。
+Snapshot 三 RPC 并发化和 `account/updated` 实时账号变化已经完成；下一步可以停止折腾 RPC 架构，把精力转到 Tray、通知和 UI 上。
 
 [1]: https://developers.openai.com/codex/app-server "Codex App Server | ChatGPT Learn"

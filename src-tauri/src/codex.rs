@@ -510,6 +510,22 @@ impl CodexRpcClient {
                 }
             }
         }
+
+        if method == "account/updated" {
+            println!("[Codex RPC] account updated");
+
+            if let Err(error) = self.app.emit(
+                "codex://account-updated",
+                message
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ) {
+                eprintln!(
+                    "[Tauri] failed to emit account update: {error}"
+                );
+            }
+        }
     }
 
     fn request_internal(
