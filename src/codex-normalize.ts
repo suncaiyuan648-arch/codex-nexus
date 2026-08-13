@@ -25,33 +25,33 @@ export function formatWindowLabel(
   minutes: number,
 ): string {
   if (minutes === 300) {
-    return "5 Hours";
+    return "5 小时";
   }
 
   if (minutes === 1440) {
-    return "Daily";
+    return "每日";
   }
 
   if (minutes === 10080) {
-    return "Weekly";
+    return "每周";
   }
 
   if (minutes % 10080 === 0) {
     const weeks = minutes / 10080;
-    return `${weeks} Week${weeks > 1 ? "s" : ""}`;
+    return `${weeks} 周`;
   }
 
   if (minutes % 1440 === 0) {
     const days = minutes / 1440;
-    return `${days} Day${days > 1 ? "s" : ""}`;
+    return `${days} 天`;
   }
 
   if (minutes % 60 === 0) {
     const hours = minutes / 60;
-    return `${hours} Hour${hours > 1 ? "s" : ""}`;
+    return `${hours} 小时`;
   }
 
-  return `${minutes} Minutes`;
+  return `${minutes} 分钟`;
 }
 
 export function normalizeRateLimits(

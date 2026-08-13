@@ -1017,6 +1017,146 @@ fn first_existing(
         .find(|path| path_is_file(path))
 }
 
+fn path_entries_from_env() -> Vec<PathBuf> {
+    env::var_os("PATH")
+        .map(|path| {
+            env::split_paths(&path)
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn executable_candidates_in_path() -> Vec<PathBuf> {
+    let names = if cfg!(target_os = "windows") {
+        vec![
+            "codex.exe",
+            "codex.cmd",
+            "codex.bat",
+        ]
+    } else {
+        vec!["codex"]
+    };
+
+    path_entries_from_env()
+        .into_iter()
+        .flat_map(|directory| {
+            names
+                .iter()
+                .map(move |name| directory.join(name))
+        })
+        .filter(|path| path_is_file(path))
+        .collect()
+}
+
+fn shell_path_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        return Vec::new();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let shell = env::var("SHELL")
+            .unwrap_or_else(|_| "/bin/sh".into());
+
+        let output = Command::new(shell)
+            .args(["-ilc", "command -v codex"])
+            .output();
+
+        output
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let path = PathBuf::from(line.trim());
+
+                        if path_is_file(&path) {
+                            Some(path)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn macos_codex_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = vec![
+            PathBuf::from(
+                "/Applications/ChatGPT.app/Contents/Resources/codex",
+            ),
+            PathBuf::from(
+                "/Applications/Codex.app/Contents/Resources/codex",
+            ),
+        ];
+
+        if let Ok(home) = env::var("HOME") {
+            let home = PathBuf::from(home);
+
+            candidates.extend([
+                home.join("Applications/ChatGPT.app/Contents/Resources/codex"),
+                home.join("Applications/Codex.app/Contents/Resources/codex"),
+            ]);
+        }
+
+        candidates
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+fn unix_codex_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        return Vec::new();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut candidates = vec![
+            PathBuf::from("/opt/homebrew/bin/codex"),
+            PathBuf::from("/usr/local/bin/codex"),
+            PathBuf::from("/usr/bin/codex"),
+        ];
+
+        if let Ok(home) = env::var("HOME") {
+            let home = PathBuf::from(home);
+
+            candidates.extend([
+                home.join(".local/bin/codex"),
+                home.join(".npm-global/bin/codex"),
+                home.join(".volta/bin/codex"),
+                home.join(".nvm/current/bin/codex"),
+                home.join(".fnm/current/bin/codex"),
+            ]);
+        }
+
+        if let Ok(path) = env::var("NVM_BIN") {
+            candidates.push(PathBuf::from(path).join("codex"));
+        }
+
+        if let Ok(path) = env::var("FNM_MULTISHELL_PATH") {
+            candidates.push(PathBuf::from(path).join("codex"));
+        }
+
+        if let Ok(path) = env::var("VOLTA_HOME") {
+            candidates.push(PathBuf::from(path).join("bin/codex"));
+        }
+
+        candidates
+    }
+}
+
 fn resolve_codex()
     -> Result<CodexCommand, String>
 {
@@ -1113,43 +1253,11 @@ fn resolve_codex()
 
     #[cfg(not(target_os = "windows"))]
     {
-        if let Ok(output) =
-            Command::new("which")
-                .arg("codex")
-                .output()
-        {
-            if output.status.success() {
-                if let Some(line) =
-                    String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .find(|line| !line.trim().is_empty())
-                {
-                    return Ok(
-                        command_for_path(
-                            PathBuf::from(line.trim())
-                        )
-                    );
-                }
-            }
-        }
-
-        let mut candidates = vec![
-            PathBuf::from("/opt/homebrew/bin/codex"),
-            PathBuf::from("/usr/local/bin/codex"),
-            PathBuf::from("/usr/bin/codex"),
-        ];
-
-        if let Ok(home) = env::var("HOME") {
-            let home = PathBuf::from(home);
-
-            candidates.push(
-                home.join(".local/bin/codex")
-            );
-
-            candidates.push(
-                home.join(".npm-global/bin/codex")
-            );
-        }
+        let mut candidates = Vec::new();
+        candidates.extend(executable_candidates_in_path());
+        candidates.extend(shell_path_candidates());
+        candidates.extend(macos_codex_candidates());
+        candidates.extend(unix_codex_candidates());
 
         if let Some(path) = first_existing(candidates) {
             return Ok(command_for_path(path));
@@ -1157,7 +1265,7 @@ fn resolve_codex()
     }
 
     Err(
-        "Cannot find `codex`. Run `codex --version` or set CODEX_BIN."
+        "Cannot find `codex`. Checked PATH, the login shell PATH, common package-manager directories, and platform app bundles. Run `codex --version` or set CODEX_BIN."
             .into(),
     )
 }

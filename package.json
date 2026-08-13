@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "branding:generate": "python3 scripts/branding_assets.py generate",
+    "branding:verify": "python3 scripts/branding_assets.py verify"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

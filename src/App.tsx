@@ -72,7 +72,7 @@ function QuotaCard({
       <div className="row quota-head">
         <div>
           <div className="eyebrow">
-            RATE LIMIT
+            速率限制
           </div>
 
           <h2>
@@ -87,7 +87,7 @@ function QuotaCard({
 
       <div
         className="bar"
-        aria-label={`${used}% used`}
+        aria-label={`已使用 ${used}%`}
       >
         <div
           className="bar-fill"
@@ -101,7 +101,7 @@ function QuotaCard({
         <span>
           {Math.round(remaining)}%
           {" "}
-          remaining
+          剩余
         </span>
 
         <span>
@@ -924,20 +924,20 @@ function App() {
     useMemo(
       () => {
         if (!connection) {
-          return "Starting";
+          return "启动中";
         }
 
         switch (
         connection.phase
         ) {
           case "ready":
-            return "Connected";
+            return "已连接";
 
           case "connecting":
-            return "Connecting";
+            return "连接中";
 
           case "initializing":
-            return "Initializing";
+            return "初始化中";
 
           case "reconnecting":
             if (
@@ -945,18 +945,18 @@ function App() {
                 !== null
             ) {
               return (
-                `Reconnecting · retry in ${Math.ceil(
+                `重连中 · ${Math.ceil(
                   retryCountdownMs
                   / 1000,
                 )
-                }s`
+                } 秒后重试`
               );
             }
 
-            return "Reconnecting";
+            return "重连中";
 
           case "disconnected":
-            return "Disconnected";
+            return "已断开";
 
           default:
             return connection.phase;
@@ -1028,16 +1028,16 @@ function App() {
       () => {
         switch (accountState) {
           case "signedIn":
-            return "Account signed in";
+            return "账号已登录";
 
           case "signedOut":
-            return "Account unavailable";
+            return "账号不可用";
 
           case "error":
-            return "Account error";
+            return "账号错误";
 
           default:
-            return "Account status unknown";
+            return "账号状态未知";
         }
       },
       [accountState],
@@ -1073,7 +1073,7 @@ function App() {
             <div
               className="title"
             >
-              Codex Monitor
+              Codex 监控
             </div>
 
             <div
@@ -1084,7 +1084,7 @@ function App() {
                   ?.account
                   ?.account
                   ?.email
-                ?? "Local Codex account"
+                ?? "本地 Codex 账号"
               }
 
               {
@@ -1115,7 +1115,7 @@ function App() {
                 connection
                   ?.generation
 
-                  ? ` · connection #${connection
+                  ? ` · 连接 #${connection
                     .generation
                   }`
 
@@ -1149,8 +1149,8 @@ function App() {
         >
           {
             loading
-              ? "Loading…"
-              : "Refresh"
+              ? "加载中…"
+              : "刷新"
           }
         </button>
       </header>
@@ -1202,13 +1202,13 @@ function App() {
                       !== null
                       && retryCountdownMs
                         > 0
-                      ? `Retrying in ${Math.ceil(
+                      ? `${Math.ceil(
                         retryCountdownMs
                         / 1000,
-                      )}s`
-                      : "Retrying…"
+                      )} 秒后重试`
+                      : "正在重试…"
 
-                    : "Waiting to reconnect…"
+                    : "等待重新连接…"
                 }
               </p>
 
@@ -1223,8 +1223,8 @@ function App() {
               >
                 {
                   reconnectingManually
-                    ? "Retrying…"
-                    : "Retry now"
+                    ? "正在重试…"
+                    : "立即重试"
                 }
               </button>
             </section>
@@ -1250,8 +1250,8 @@ function App() {
                 {
                   accountState
                     === "signedOut"
-                    ? "Codex connected, but no signed-in account is currently available."
-                    : "Codex connected, but account information is currently unavailable."
+                    ? "Codex 已连接，但当前没有已登录账号。"
+                    : "Codex 已连接，但当前无法获取账号信息。"
                 }
               </p>
 
@@ -1369,8 +1369,7 @@ function App() {
                         className="error-card"
                       >
                         <strong>
-                          No rate limit
-                          data returned.
+                          未返回速率限制数据。
                         </strong>
                       </section>
                     )
@@ -1392,7 +1391,7 @@ function App() {
                   <div
                     className="eyebrow"
                   >
-                    TODAY
+                    今日
                   </div>
 
                   <div
@@ -1408,7 +1407,7 @@ function App() {
                   <div
                     className="muted small"
                   >
-                    tokens
+                    token
                   </div>
                 </div>
 
@@ -1418,7 +1417,7 @@ function App() {
                   <div
                     className="eyebrow"
                   >
-                    LIFETIME
+                    累计
                   </div>
 
                   <div
@@ -1436,7 +1435,7 @@ function App() {
                   <div
                     className="muted small"
                   >
-                    tokens
+                    token
                   </div>
                 </div>
 
@@ -1446,7 +1445,7 @@ function App() {
                   <div
                     className="eyebrow"
                   >
-                    PEAK DAY
+                    单日峰值
                   </div>
 
                   <div
@@ -1464,7 +1463,7 @@ function App() {
                   <div
                     className="muted small"
                   >
-                    tokens
+                    token
                   </div>
                 </div>
               </section>
@@ -1485,11 +1484,11 @@ function App() {
                     <div
                       className="eyebrow"
                     >
-                      ACTIVITY
+                      活动
                     </div>
 
                     <h2>
-                      Last 7 days
+                      最近 7 天
                     </h2>
                   </div>
 
@@ -1498,9 +1497,9 @@ function App() {
                   >
                     {
                       connectionReady
-                        ? "Quota realtime · Usage 5 min"
+                        ? "配额实时更新 · 用量每 5 分钟更新"
 
-                        : "Offline · showing last known data"
+                        : "离线 · 显示最近数据"
                     }
                   </div>
                 </div>
@@ -1536,7 +1535,7 @@ function App() {
                             title={
                               `${item.startDate
                               }: ${item.tokens
-                              } tokens`
+                              } token`
                             }
                           >
                             <div
@@ -1633,7 +1632,7 @@ function App() {
         <span>
           {
             snapshot?.fetchedAt
-              ? `Updated ${new Date(
+              ? `更新时间：${new Date(
                 snapshot
                   .fetchedAt,
               )

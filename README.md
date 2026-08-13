@@ -321,11 +321,42 @@ Codex Nexus can live in the system tray instead of occupying a permanent desktop
 
 Current tray capabilities include:
 
+* Live quota summary in the tray tooltip and menu
+* Weekly usage percentage, remaining percentage, reset time, and today's token usage
+* Closing the dashboard hides it to the tray while background monitoring continues
 * Open Codex Nexus
 * Restore the main window
 * Quit the application
 
 The tray will become a larger part of the product as the project evolves.
+
+Tray design sources are intentionally split from the generated runtime assets:
+
+```text
+assets/branding/
+├── app/
+│   ├── app-icon-master.svg
+│   └── app-icon-master.png   # 1024×1024 transparent RGBA Master
+└── tray/
+    ├── tray-macos.svg
+    ├── tray-macos.png        # transparent black Template source
+    ├── tray-windows.svg
+    └── tray-windows.png      # transparent brand-colored source
+
+src-tauri/icons/
+├── icon.icns, icon.ico       # generated App Icon containers
+├── *.png                     # generated App/Store platform sizes
+└── tray/                     # generated runtime Tray sizes
+```
+
+The macOS asset is loaded as a black/transparent template image. Windows uses
+the colored multi-size ICO so its tray icon remains legible across DPI scales.
+The generated files must never be edited back into the branding sources, and
+the generator uses a transparent iOS/Android background instead of adding a
+white fill.
+
+Run `pnpm run branding:generate` after changing a branding source, then run
+`pnpm run branding:verify` to confirm every PNG edge pixel has `Alpha=0`.
 
 ---
 
@@ -1018,6 +1049,19 @@ Example locations:
 
 %APPDATA%\npm\codex.cmd
 ```
+
+On macOS, Codex Nexus also checks the Codex executable bundled with the
+ChatGPT desktop app, plus common Homebrew, npm, fnm, nvm, and Volta locations:
+
+```text
+/Applications/ChatGPT.app/Contents/Resources/codex
+/opt/homebrew/bin/codex
+~/.local/bin/codex
+~/.volta/bin/codex
+```
+
+If the desktop app was launched with a reduced environment, the resolver also
+asks the user's login shell for `codex` before falling back to these paths.
 
 It also checks the result of:
 
