@@ -1,12 +1,12 @@
 [package]
-name = "codex-usage-monitor"
+name = "codex-nexus"
 version = "0.1.0"
 description = "Local Codex quota and token usage monitor"
 authors = ["you"]
 edition = "2021"
 
 [lib]
-name = "codex_usage_monitor_lib"
+name = "codex_nexus_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

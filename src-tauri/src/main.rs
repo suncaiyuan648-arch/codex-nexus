@@ -1,3 +1,3 @@
 fn main() {
-    codex_usage_monitor_lib::run();
+    codex_nexus_lib::run();
 }

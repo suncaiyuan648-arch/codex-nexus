@@ -243,8 +243,8 @@ impl CodexRpcClient {
             "initialize",
             Some(json!({
                 "clientInfo": {
-                    "name": "codex_usage_monitor",
-                    "title": "Codex Usage Monitor",
+                    "name": "codex_nexus",
+                    "title": "Codex Nexus",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             })),

@@ -4,7 +4,7 @@
 
 **Codex Nexus** is an unofficial, cross-platform desktop toolkit built around Codex.
 
-It started as a lightweight Codex usage monitor, but the goal is broader: provide a collection of small, focused tools that make Codex easier to monitor, manage, and use in daily development workflows.
+It started as a lightweight Codex companion, but the goal is broader: provide a collection of small, focused tools that make Codex easier to monitor, manage, and use in daily development workflows.
 
 Instead of becoming another AI client or editor, Codex Nexus stays focused on one thing:
 
@@ -1242,7 +1242,7 @@ The first line means the request was sent.
 
 The second line means the response for the same request ID was received.
 
-One snapshot refresh currently reads:
+One snapshot refresh currently reads these three independent RPCs:
 
 ```text
 account/read
@@ -1252,7 +1252,7 @@ account/rateLimits/read
 account/usage/read
 ```
 
-A normal refresh therefore produces three request / response pairs.
+The three requests are sent concurrently by the shared RPC client, so a normal refresh produces three overlapping request / response pairs rather than waiting for each request to finish before sending the next one.
 
 ---
 

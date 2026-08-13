@@ -24,7 +24,7 @@ macOS 路径兼容             ✅
 
 ### 1. Snapshot 三个 RPC 改成并发
 
-你现在一次 Refresh 是：
+此前一次 Refresh 是：
 
 ```text
 account/read
@@ -36,7 +36,7 @@ usage/read
 
 也就是串行。
 
-实际上这三个请求之间没有依赖，可以：
+实际上这三个请求之间没有依赖，因此现在改为：
 
 ```text
              ┌─ account/read
@@ -68,7 +68,7 @@ max(
 
 这也是你刚做 `pendingRequests` 真正开始产生价值的地方。
 
-**这个我建议下一步就做。**
+**已完成。** `get_codex_snapshot` 现在会先并发发出这三个请求，再统一等待结果；因此一次 Refresh 的耗时不再叠加三个 RPC 的响应时间。
 
 ---
 
@@ -332,7 +332,7 @@ account/usage/read
 
 ```text
 AppData/
-└── Codex Usage Monitor/
+└── Codex Nexus/
     └── usage-history.json
 ```
 
@@ -591,13 +591,13 @@ CodexRpcClient
 Windows：
 
 ```text
-CodexUsageMonitor_0.1.0_x64-setup.exe
+CodexNexus_0.1.0_x64-setup.exe
 ```
 
 macOS：
 
 ```text
-CodexUsageMonitor_0.1.0_universal.dmg
+CodexNexus_0.1.0_universal.dmg
 ```
 
 之后再处理：
@@ -707,7 +707,7 @@ settings
 ```text
 当前
   ↓
-① Snapshot 三 RPC 并发化
+① Snapshot 三 RPC 并发化 ✅
   ↓
 ② account/updated 实时账号变化
   ↓
@@ -741,6 +741,6 @@ reset credit
 
 都可以算 V1.5/V2。
 
-下一步最适合先做 **Snapshot 三 RPC 并发化 + `account/updated`**。因为这是最后两块后端基础能力；做完以后我们就可以停止折腾 RPC 架构，把精力转到 Tray、通知和 UI 上。
+Snapshot 三 RPC 并发化已经完成。下一步最适合做 **`account/updated` 实时账号变化**；完成后我们就可以停止折腾 RPC 架构，把精力转到 Tray、通知和 UI 上。
 
 [1]: https://developers.openai.com/codex/app-server "Codex App Server | ChatGPT Learn"

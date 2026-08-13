@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use std::{
     sync::Arc,
+    thread,
     time::{
         SystemTime,
         UNIX_EPOCH,
@@ -47,15 +48,62 @@ fn get_codex_snapshot(
 ) -> Result<Value, String> {
     let client = &state.client;
 
+    // These RPCs are independent, so send all three before waiting for any
+    // response. The client's request IDs and pending map route responses back
+    // to the matching worker.
+    let (
+        account_result,
+        rate_limits_result,
+        usage_result,
+    ) = thread::scope(|scope| {
+        let account = scope.spawn(|| {
+            client.request(
+                "account/read",
+                Some(json!({
+                    "refreshToken": false
+                })),
+            )
+        });
+
+        let rate_limits = scope.spawn(|| {
+            client.request(
+                "account/rateLimits/read",
+                None,
+            )
+        });
+
+        let usage = scope.spawn(|| {
+            client.request(
+                "account/usage/read",
+                None,
+            )
+        });
+
+        let account_result = account
+            .join()
+            .map_err(|_| "Account RPC worker panicked".to_string())?;
+
+        let rate_limits_result = rate_limits
+            .join()
+            .map_err(|_| "Rate limits RPC worker panicked".to_string())?;
+
+        let usage_result = usage
+            .join()
+            .map_err(|_| "Usage RPC worker panicked".to_string())?;
+
+        Ok::<_, String>(
+            (
+                account_result,
+                rate_limits_result,
+                usage_result,
+            )
+        )
+    })?;
+
     let (
         account,
         account_error,
-    ) = match client.request(
-        "account/read",
-        Some(json!({
-            "refreshToken": false
-        })),
-    ) {
+    ) = match account_result {
         Ok(value) => (
             Some(value),
             None,
@@ -67,18 +115,12 @@ fn get_codex_snapshot(
         ),
     };
 
-    let rate_limits = client.request(
-        "account/rateLimits/read",
-        None,
-    )?;
+    let rate_limits = rate_limits_result?;
 
     let (
         usage,
         usage_error,
-    ) = match client.request(
-        "account/usage/read",
-        None,
-    ) {
+    ) = match usage_result {
         Ok(value) => (
             Some(value),
             None,
@@ -170,7 +212,7 @@ pub fn run() {
                 TrayIconBuilder::new()
 
                     .tooltip(
-                        "Codex Usage Monitor"
+                        "Codex Nexus"
                     )
 
                     .menu(
