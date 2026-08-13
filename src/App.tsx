@@ -33,6 +33,8 @@ import {
   formatReset,
 } from "./lib/format";
 
+import codexIcon from "../assets/branding/app/app-icon-macos.png";
+
 /*
  * ============================================================
  * Quota Card
@@ -1065,8 +1067,11 @@ function App() {
         <div
           className="brand"
         >
-          <div
-            className="brand-dot"
+          <img
+            className="brand-mark"
+            src={codexIcon}
+            alt=""
+            aria-hidden="true"
           />
 
           <div>
@@ -1107,8 +1112,13 @@ function App() {
              * Connection status
              */}
             <div
-              className="muted tiny"
+              className={`status-line status-${connection?.phase ?? "unknown"}`}
             >
+              <span
+                className="status-dot"
+                aria-hidden="true"
+              />
+
               {connectionText}
 
               {
@@ -1124,7 +1134,7 @@ function App() {
             </div>
 
             <div
-              className="muted tiny"
+              className="account-line muted tiny"
             >
               {accountText}
             </div>
@@ -1583,7 +1593,7 @@ function App() {
           : (
             !error && (
               <section
-                className="error-card"
+                className="status-card"
               >
                 <strong>
                   {
