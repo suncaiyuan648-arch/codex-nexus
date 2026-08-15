@@ -2,7 +2,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::models::{Confidence, SOURCE_APP_SERVER, SOURCE_OFFICIAL};
+use super::models::{
+    Confidence, PROVENANCE_ACCOUNT_RATE_LIMIT, PROVENANCE_APP_SERVER_THREAD_USAGE, SOURCE_OFFICIAL,
+};
 use super::{db, quota};
 
 pub fn now_seconds() -> i64 {
@@ -180,6 +182,187 @@ pub fn record_rate_limit_update(
     record_rate_limit_samples(&connection, &account_key, now_seconds(), payload)
 }
 
+fn normalize_reasoning(value: Option<&Value>) -> String {
+    match string_value(value)
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("low") | Some("medium") | Some("high") | Some("xhigh") | Some("ultra") => {
+            string_value(value).unwrap().to_ascii_lowercase()
+        }
+        _ => "unknown".into(),
+    }
+}
+
+fn normalize_speed(value: Option<&Value>) -> String {
+    match string_value(value)
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("standard") | Some("default") => "standard".into(),
+        Some("fast") | Some("priority") | Some("fast_requested") => "fast_requested".into(),
+        _ => "unknown".into(),
+    }
+}
+
+fn record_thread_usage_capability(
+    connection: &Connection,
+    account_key: &str,
+    thread_id: &str,
+    attempted_at: i64,
+    capability: &str,
+    sampled_at: Option<i64>,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let latest_turn_update: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(updated_at) FROM turn_usage
+             WHERE account_key = ?1 AND thread_id = ?2",
+            params![account_key, thread_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let previous_attempt: Option<i64> = connection
+        .query_row(
+            "SELECT last_attempted_at FROM thread_usage_capabilities
+             WHERE account_key = ?1 AND thread_id = ?2",
+            params![account_key, thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if previous_attempt.is_some_and(|attempt| latest_turn_update.unwrap_or_default() > attempt) {
+        connection
+            .execute(
+                "UPDATE thread_usage_capabilities SET retry_count = 0
+                 WHERE account_key = ?1 AND thread_id = ?2",
+                params![account_key, thread_id],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    connection
+        .execute(
+            "INSERT INTO thread_usage_capabilities
+             (account_key, thread_id, last_attempted_at, last_sampled_at, capability, error, retry_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+             ON CONFLICT(account_key, thread_id) DO UPDATE SET
+               last_attempted_at = excluded.last_attempted_at,
+               last_sampled_at = excluded.last_sampled_at,
+               capability = excluded.capability,
+               error = excluded.error,
+               retry_count = thread_usage_capabilities.retry_count + 1",
+            params![
+                account_key,
+                thread_id,
+                attempted_at,
+                sampled_at,
+                capability,
+                error
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Persist the server's thread-level usage snapshot without merging it into
+/// local turn usage. `threadUsage` is optional and may be null when the
+/// account/server cannot expose billing data.
+pub fn record_thread_usage_snapshot(
+    app: &tauri::AppHandle<tauri::Wry>,
+    thread_id: &str,
+    response: &Value,
+) -> Result<(), String> {
+    let connection = db::open_database(app)?;
+    let Some(account_key) = current_account_key(&connection)? else {
+        return Ok(());
+    };
+    let sampled_at = timestamp(response.get("sampledAt")).max(now_seconds());
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let thread_usage = response.get("threadUsage").and_then(Value::as_object);
+    let capability = if thread_usage.is_some() {
+        "available"
+    } else {
+        "unavailable"
+    };
+    record_thread_usage_capability(
+        &transaction,
+        &account_key,
+        thread_id,
+        sampled_at,
+        capability,
+        thread_usage.map(|_| sampled_at),
+        None,
+    )?;
+
+    if let Some(thread_usage) = thread_usage {
+        let groups = thread_usage
+            .get("groups")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let usage_thread_id = thread_usage
+            .get("threadId")
+            .and_then(Value::as_str)
+            .unwrap_or(thread_id);
+        let estimated_usd = number_i64(thread_usage.get("estimatedUsageUsdMicros"));
+        for group in groups {
+            let Some(credits) = number_i64(group.get("estimatedUsageCreditsMicros")) else {
+                continue;
+            };
+            transaction
+                .execute(
+                    "INSERT INTO thread_usage_group_samples
+                     (account_key, thread_id, sampled_at, model, reasoning_effort, speed_mode,
+                      estimated_usage_credits_micros, estimated_usage_usd_micros,
+                      net_new_input_tokens, cached_input_tokens, input_tokens, output_tokens,
+                      total_tokens, source, confidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    params![
+                        account_key,
+                        usage_thread_id,
+                        sampled_at,
+                        string_value(group.get("model")),
+                        normalize_reasoning(group.get("reasoningEffort")),
+                        normalize_speed(group.get("speed")),
+                        credits.max(0),
+                        estimated_usd,
+                        number_i64(group.get("netNewInputTokens")),
+                        number_i64(group.get("cachedInputTokens")),
+                        number_i64(group.get("inputTokens")),
+                        number_i64(group.get("outputTokens")),
+                        number_i64(group.get("totalTokens")),
+                        PROVENANCE_APP_SERVER_THREAD_USAGE,
+                        "high",
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+pub fn record_thread_usage_failure(
+    app: &tauri::AppHandle<tauri::Wry>,
+    thread_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    let connection = db::open_database(app)?;
+    let Some(account_key) = current_account_key(&connection)? else {
+        return Ok(());
+    };
+    record_thread_usage_capability(
+        &connection,
+        &account_key,
+        thread_id,
+        now_seconds(),
+        "error",
+        None,
+        Some(error),
+    )
+}
+
 pub fn current_account_key(connection: &Connection) -> Result<Option<String>, String> {
     connection
         .query_row(
@@ -189,6 +372,100 @@ pub fn current_account_key(connection: &Connection) -> Result<Option<String>, St
         )
         .optional()
         .map_err(|error| error.to_string())
+}
+
+pub fn pending_thread_usage_threads(
+    connection: &Connection,
+    now: i64,
+) -> Result<Vec<String>, String> {
+    let Some(account_key) = current_account_key(connection)? else {
+        return Ok(Vec::new());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT t.thread_id
+             FROM turn_usage t
+             LEFT JOIN thread_usage_capabilities c
+               ON c.account_key = t.account_key AND c.thread_id = t.thread_id
+             WHERE t.account_key = ?1
+               AND t.completed_at IS NOT NULL
+               AND length(t.thread_id) = 36
+               AND substr(t.thread_id, 9, 1) = '-'
+               AND substr(t.thread_id, 14, 1) = '-'
+               AND substr(t.thread_id, 19, 1) = '-'
+               AND substr(t.thread_id, 24, 1) = '-'
+             GROUP BY t.thread_id
+             HAVING c.last_attempted_at IS NULL
+                OR (MAX(t.updated_at) > c.last_attempted_at
+                    AND c.last_attempted_at <= ?2 - 15)
+                OR (MAX(t.updated_at) <= c.last_attempted_at
+                    AND c.retry_count < 4
+                    AND c.last_attempted_at <= ?2 -
+                      CASE c.retry_count
+                        WHEN 1 THEN 15
+                        WHEN 2 THEN 60
+                        WHEN 3 THEN 120
+                        ELSE 15
+                      END)
+             ORDER BY MAX(t.updated_at) DESC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![account_key, now], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| row.map_err(|error| error.to_string()))
+        .collect()
+}
+
+pub fn next_thread_usage_at(connection: &Connection, now: i64) -> Result<Option<i64>, String> {
+    let Some(account_key) = current_account_key(connection)? else {
+        return Ok(None);
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT MAX(t.updated_at), c.last_attempted_at, COALESCE(c.retry_count, 0)
+             FROM turn_usage t
+             LEFT JOIN thread_usage_capabilities c
+               ON c.account_key = t.account_key AND c.thread_id = t.thread_id
+             WHERE t.account_key = ?1
+               AND t.completed_at IS NOT NULL
+               AND length(t.thread_id) = 36
+               AND substr(t.thread_id, 9, 1) = '-'
+               AND substr(t.thread_id, 14, 1) = '-'
+               AND substr(t.thread_id, 19, 1) = '-'
+               AND substr(t.thread_id, 24, 1) = '-'
+             GROUP BY t.thread_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![account_key], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut next = None;
+    for row in rows {
+        let (latest_update, last_attempt, retry_count) = row.map_err(|error| error.to_string())?;
+        let Some(latest_update) = latest_update else {
+            continue;
+        };
+        let due_at = match last_attempt {
+            None => now,
+            Some(last_attempt) if latest_update > last_attempt => last_attempt.saturating_add(15),
+            Some(_) if retry_count >= 4 => continue,
+            Some(last_attempt) => last_attempt.saturating_add(match retry_count {
+                1 => 15,
+                2 => 60,
+                3 => 120,
+                _ => 15,
+            }),
+        };
+        next = Some(next.map_or(due_at, |current: i64| current.min(due_at)));
+    }
+    Ok(next)
 }
 
 fn record_rate_limit_samples(
@@ -271,7 +548,7 @@ fn record_rate_limit_samples(
                         used_percent,
                         resets_at,
                         number_i64(snapshot.get("generation")),
-                        SOURCE_APP_SERVER,
+                        PROVENANCE_ACCOUNT_RATE_LIMIT,
                         "high"
                     ],
                 )

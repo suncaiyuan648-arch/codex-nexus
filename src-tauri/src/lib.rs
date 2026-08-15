@@ -168,8 +168,11 @@ fn get_usage_analytics_v1(
 }
 
 #[tauri::command]
-fn get_daily_model_usage(app: AppHandle<Wry>) -> Result<usage::DailyModelUsage, String> {
-    usage::analytics::app_daily_model_usage(&app)
+fn get_category_usage(
+    app: AppHandle<Wry>,
+    period: Option<String>,
+) -> Result<usage::CategoryUsage, String> {
+    usage::analytics::app_category_usage(&app, period.as_deref().unwrap_or("day"))
 }
 
 pub(crate) fn fetch_codex_snapshot(client: &Arc<CodexRpcClient>) -> Result<Value, String> {
@@ -713,7 +716,7 @@ pub fn run() {
             get_usage_history,
             get_usage_analytics,
             get_usage_analytics_v1,
-            get_daily_model_usage
+            get_category_usage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

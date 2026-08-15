@@ -11,9 +11,10 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 use crate::{codex::CodexRpcClient, monitor};
 
-use super::{recorder, rollout};
+use super::{quota, recorder, rollout};
 
 const LOCAL_USAGE_DEBOUNCE: Duration = Duration::from_secs(3);
+const SETTLEMENT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(12), Duration::from_secs(30)];
 const LONG_IDLE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +105,19 @@ pub struct UsageRefreshScheduler {
 
 pub struct UsageSchedulerState {
     pub scheduler: Arc<UsageRefreshScheduler>,
+}
+
+#[derive(Clone, Debug)]
+struct QuotaMarker {
+    used_percent: f64,
+    resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct SettlementState {
+    stage: usize,
+    baseline: Option<QuotaMarker>,
+    next_at: Instant,
 }
 
 impl UsageRefreshScheduler {
@@ -289,7 +303,9 @@ fn run_scheduler(
 ) {
     let _ = rollout::collect_rollouts(&app);
     let mut next_fallback = Instant::now() + policy.fallback_duration(is_foreground(&app), false);
+    let mut next_thread_usage: Option<Instant> = None;
     let mut debounce_deadline: Option<Instant> = None;
+    let mut settlement: Option<SettlementState> = None;
     let mut last_local_activity: Option<Instant> = None;
     let mut last_local_activity_at: Option<i64> = None;
     let mut last_refresh_at: Option<i64> = None;
@@ -307,6 +323,10 @@ fn run_scheduler(
         let wait = [
             Some(next_fallback.saturating_duration_since(now)),
             debounce_deadline.map(|deadline| deadline.saturating_duration_since(now)),
+            settlement
+                .as_ref()
+                .map(|state| state.next_at.saturating_duration_since(now)),
+            next_thread_usage.map(|deadline| deadline.saturating_duration_since(now)),
         ]
         .into_iter()
         .flatten()
@@ -318,7 +338,7 @@ fn run_scheduler(
             &policy,
             foreground,
             fallback,
-            debounce_deadline.is_some(),
+            debounce_deadline.is_some() || settlement.is_some(),
             watcher_active,
             last_refresh_at,
             last_local_activity_at,
@@ -326,11 +346,14 @@ fn run_scheduler(
 
         match receiver.recv_timeout(wait) {
             Ok(SchedulerCommand::ConnectionReady) | Ok(SchedulerCommand::AccountUpdated) => {
+                debounce_deadline = None;
+                settlement = None;
                 if let Err(error) =
                     perform_full_refresh(&app, &client, &latest_snapshot, &mut last_refresh_at)
                 {
                     eprintln!("[Usage] scheduler full refresh failed: {error}");
                 }
+                next_thread_usage = thread_usage_deadline(&app);
                 next_fallback = Instant::now() + fallback;
             }
             Ok(SchedulerCommand::RefreshNow(response)) => {
@@ -339,6 +362,7 @@ fn run_scheduler(
                 if let Err(error) = &result {
                     eprintln!("[Usage] scheduler manual refresh failed: {error}");
                 }
+                next_thread_usage = thread_usage_deadline(&app);
                 if let Some(response) = response {
                     let _ = response.send(result);
                 }
@@ -349,8 +373,14 @@ fn run_scheduler(
                 next_fallback = Instant::now();
             }
             Ok(SchedulerCommand::RateLimitUpdated) => {
-                // The Codex notification path has already persisted the
-                // quota sample synchronously. Do not issue a read here.
+                // The notification path has already persisted the sample.
+                // It also gives the short-lived settlement loop a chance to
+                // stop early when the server has settled the Turn.
+                if let Some(state) = settlement.as_ref() {
+                    if quota_marker_changed(&state.baseline, &latest_weekly_quota_marker(&app)) {
+                        settlement = None;
+                    }
+                }
             }
             Ok(SchedulerCommand::LocalFileChanged(path)) => {
                 if !path.as_os_str().is_empty() {
@@ -359,6 +389,12 @@ fn run_scheduler(
                             last_local_activity = Some(Instant::now());
                             last_local_activity_at = Some(now_seconds());
                             debounce_deadline = Some(Instant::now() + LOCAL_USAGE_DEBOUNCE);
+                            settlement = Some(SettlementState {
+                                stage: 0,
+                                baseline: latest_weekly_quota_marker(&app),
+                                next_at: Instant::now() + LOCAL_USAGE_DEBOUNCE,
+                            });
+                            next_thread_usage = None;
                         }
                         Ok(false) => {}
                         Err(error) => eprintln!("[Usage] rollout event processing failed: {error}"),
@@ -367,7 +403,13 @@ fn run_scheduler(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let mut reconciled = false;
+                let mut thread_usage_refreshed = false;
                 if debounce_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                    if let Err(error) = perform_thread_usage_refresh(&app, &client) {
+                        eprintln!("[Usage] thread usage refresh failed: {error}");
+                    }
+                    next_thread_usage = thread_usage_deadline(&app);
+                    thread_usage_refreshed = true;
                     if let Err(error) = perform_reconciliation(
                         &app,
                         &client,
@@ -378,6 +420,29 @@ fn run_scheduler(
                     }
                     debounce_deadline = None;
                     reconciled = true;
+                    settle_after_reconciliation(&app, &mut settlement);
+                } else if settlement
+                    .as_ref()
+                    .is_some_and(|state| state.next_at <= Instant::now())
+                {
+                    if let Err(error) = perform_reconciliation(
+                        &app,
+                        &client,
+                        &latest_snapshot,
+                        &mut last_refresh_at,
+                    ) {
+                        eprintln!("[Usage] settlement reconciliation failed: {error}");
+                    }
+                    settle_after_reconciliation(&app, &mut settlement);
+                    reconciled = true;
+                }
+                if next_thread_usage.is_some_and(|deadline| deadline <= Instant::now())
+                    && !thread_usage_refreshed
+                {
+                    if let Err(error) = perform_thread_usage_refresh(&app, &client) {
+                        eprintln!("[Usage] scheduled thread usage refresh failed: {error}");
+                    }
+                    next_thread_usage = thread_usage_deadline(&app);
                 }
                 if next_fallback <= Instant::now() && !reconciled {
                     if let Err(error) = perform_reconciliation(
@@ -400,6 +465,86 @@ fn run_scheduler(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+fn latest_weekly_quota_marker(app: &AppHandle<Wry>) -> Option<QuotaMarker> {
+    let connection = super::db::open_database(app).ok()?;
+    let account_key = recorder::current_account_key(&connection).ok()??;
+    connection
+        .query_row(
+            "SELECT used_percent, resets_at
+             FROM rate_limit_samples
+             WHERE account_key = ?1 AND window = 'primary'
+               AND window_duration_mins = 10080
+             ORDER BY sampled_at DESC, id DESC LIMIT 1",
+            [&account_key],
+            |row| {
+                let used_percent: f64 = row.get(0)?;
+                let resets_at: Option<i64> = row.get(1)?;
+                Ok(QuotaMarker {
+                    used_percent,
+                    resets_at,
+                })
+            },
+        )
+        .ok()
+}
+
+fn quota_marker_changed(before: &Option<QuotaMarker>, after: &Option<QuotaMarker>) -> bool {
+    match (before, after) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (Some(before), Some(after)) => {
+            (before.used_percent - after.used_percent).abs() > f64::EPSILON
+                || !quota::same_reset_at(before.resets_at, after.resets_at)
+        }
+    }
+}
+
+fn settle_after_reconciliation(app: &AppHandle<Wry>, settlement: &mut Option<SettlementState>) {
+    let Some(state) = settlement.as_mut() else {
+        return;
+    };
+    if quota_marker_changed(&state.baseline, &latest_weekly_quota_marker(app))
+        || state.stage >= SETTLEMENT_RETRY_DELAYS.len()
+    {
+        *settlement = None;
+        return;
+    }
+    state.next_at = Instant::now() + SETTLEMENT_RETRY_DELAYS[state.stage];
+    state.stage += 1;
+}
+
+fn perform_thread_usage_refresh(
+    app: &AppHandle<Wry>,
+    client: &Arc<CodexRpcClient>,
+) -> Result<(), String> {
+    if client.status().phase != "ready" {
+        return Ok(());
+    }
+    let connection = super::db::open_database(app)?;
+    let thread_ids = recorder::pending_thread_usage_threads(&connection, now_seconds())?;
+    drop(connection);
+
+    for thread_id in thread_ids {
+        let result = client.request("account/usage/read", Some(json!({ "threadId": thread_id })));
+        match result {
+            Ok(response) => {
+                recorder::record_thread_usage_snapshot(app, &thread_id, &response)?;
+            }
+            Err(error) => {
+                recorder::record_thread_usage_failure(app, &thread_id, &error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn thread_usage_deadline(app: &AppHandle<Wry>) -> Option<Instant> {
+    let connection = super::db::open_database(app).ok()?;
+    let due_at = recorder::next_thread_usage_at(&connection, now_seconds()).ok()??;
+    let delay = due_at.saturating_sub(now_seconds()) as u64;
+    Some(Instant::now() + Duration::from_secs(delay.max(1)))
 }
 
 fn is_foreground(app: &AppHandle<Wry>) -> bool {
@@ -429,6 +574,9 @@ fn perform_full_refresh(
         return Ok(());
     }
     let snapshot = crate::fetch_codex_snapshot(client)?;
+    if let Err(error) = perform_thread_usage_refresh(app, client) {
+        eprintln!("[Usage] initial thread usage refresh failed: {error}");
+    }
     apply_snapshot(app, snapshot, latest_snapshot, last_refresh_at)
 }
 

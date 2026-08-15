@@ -106,7 +106,7 @@ h2 { margin: 5px 0 0; font-size: 21px; letter-spacing: -.02em; }
 }
 .secondary-button:hover { background: rgba(255, 255, 255, .95); }
 
-.quota-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.quota-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
 .quota-card, .chart-card, .metric, .error-card {
   border: 1px solid rgba(60, 60, 67, .16);
   background: rgba(255, 255, 255, .72);
@@ -114,9 +114,29 @@ h2 { margin: 5px 0 0; font-size: 21px; letter-spacing: -.02em; }
   backdrop-filter: blur(22px) saturate(1.2);
   -webkit-backdrop-filter: blur(22px) saturate(1.2);
 }
-.quota-card { padding: 19px; border-radius: 16px; }
+.quota-card { padding: 16px 18px; border-radius: 16px; }
 .weekly-quota-row { margin-top: 16px; align-items: stretch; }
 .daily-model-usage-card { min-width: 0; }
+.quota-estimate-section { margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(60, 60, 67, .12); }
+.quota-estimate-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.quota-estimate-heading h2, .quota-estimate-remaining h2 { margin: 0; }
+.quota-estimate-warning { margin: 13px 0 0; padding: 9px 10px; border: 1px solid rgba(255, 159, 10, .25); border-radius: 9px; color: #8a5a00; background: rgba(255, 159, 10, .08); font-size: 11px; line-height: 1.4; }
+.quota-estimate-list { display: grid; gap: 0; margin-top: 7px; }
+.quota-estimate-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; }
+.quota-estimate-row .daily-model-usage-values { max-width: 55%; }
+.quota-estimate-row .daily-model-usage-values strong { font-size: 12px; }
+.quota-estimate-divider { height: 1px; margin: 11px 0 10px; background: rgba(60, 60, 67, .18); }
+.quota-estimate-remaining { display: grid; gap: 6px; }
+.quota-estimate-remaining > div:first-child { display: grid; gap: 2px; }
+.quota-estimate-remaining-list { display: grid; gap: 4px; }
+.quota-estimate-remaining-row { display: flex; justify-content: space-between; gap: 10px; color: #3d3d42; font-size: 11px; }
+.quota-estimate-remaining-row strong { text-align: right; font-size: 11px; }
+.usage-account-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+.usage-account-metric { display: grid; gap: 5px; min-width: 0; padding: 11px; border: 1px solid rgba(60, 60, 67, .12); border-radius: 11px; background: rgba(118, 118, 128, .06); }
+.usage-account-metric strong { overflow: hidden; text-overflow: ellipsis; font-size: 19px; letter-spacing: -.04em; }
+.usage-period-tabs { display: flex; gap: 4px; margin-top: 14px; padding: 3px; width: fit-content; border-radius: 9px; background: rgba(118, 118, 128, .13); }
+.usage-period-tabs button { border: 0; border-radius: 7px; padding: 6px 10px; color: #6e6e73; background: transparent; cursor: pointer; font: inherit; font-size: 11px; }
+.usage-period-tabs button.active { color: #007aff; background: rgba(255, 255, 255, .92); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
 .daily-model-usage-notice { display: grid; gap: 4px; margin-top: 16px; padding: 10px 11px; border: 1px solid rgba(255, 159, 10, .26); border-radius: 10px; background: rgba(255, 159, 10, .08); line-height: 1.4; }
 .daily-model-usage-notice span { color: #6e6e73; font-size: 11px; }
 .daily-model-usage-list { display: grid; gap: 0; margin-top: 14px; }
@@ -131,10 +151,10 @@ h2 { margin: 5px 0 0; font-size: 21px; letter-spacing: -.02em; }
 .daily-model-usage-footnote { margin-top: 12px; line-height: 1.45; }
 .quota-head { align-items: flex-start; }
 .quota-number { font-size: 31px; font-weight: 700; letter-spacing: -.05em; color: #1d1d1f; }
-.bar { height: 8px; border-radius: 999px; background: rgba(118, 118, 128, .20); overflow: hidden; margin: 18px 0 11px; }
+.bar { height: 8px; border-radius: 999px; background: rgba(118, 118, 128, .20); overflow: hidden; margin: 14px 0 9px; }
 .bar-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, #007aff, #5ac8fa); transition: width .35s ease; }
 
-.metrics-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+.metrics-grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin-top: 16px; }
 .metric { padding: 17px 18px; border-radius: 14px; }
 .metric-value { font-size: 26px; font-weight: 700; letter-spacing: -.04em; margin: 7px 0 2px; color: #1d1d1f; }
 
@@ -236,6 +256,7 @@ h2 { margin: 5px 0 0; font-size: 21px; letter-spacing: -.02em; }
   .app-shell { padding: 22px 18px 20px; }
   .topbar { align-items: flex-start; }
   .quota-grid, .metrics-grid { grid-template-columns: 1fr; }
+  .usage-account-metrics { grid-template-columns: 1fr; }
   .chart { gap: 6px; }
   .chart-value { display: none; }
   .footer { flex-direction: column; }

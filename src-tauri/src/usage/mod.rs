@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod category_usage;
 pub mod db;
 pub mod models;
 pub mod quota;
@@ -8,7 +9,7 @@ pub mod repository;
 pub mod rollout;
 pub mod scheduler;
 
-pub use models::{AccountScope, DailyModelUsage, UsageAnalytics, UsageAnalyticsQuery};
+pub use models::{AccountScope, CategoryUsage, UsageAnalytics, UsageAnalyticsQuery};
 pub use scheduler::{UsageRefreshScheduler, UsageSchedulerState, UsageSchedulerStatus};
 
 pub fn record_official_snapshot(

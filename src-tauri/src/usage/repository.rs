@@ -402,98 +402,6 @@ fn range_label(from: &str, to: &str) -> String {
     }
 }
 
-pub fn daily_model_usage(connection: &Connection) -> Result<DailyModelUsage, String> {
-    let date = Local::now().date_naive();
-    let offset = FixedOffset::east_opt(Local::now().offset().local_minus_utc())
-        .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap());
-    let start = offset
-        .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
-        .single()
-        .unwrap()
-        .timestamp();
-    let end = offset
-        .from_local_datetime(
-            &(date
-                .succ_opt()
-                .ok_or("Invalid current date")?
-                .and_hms_opt(0, 0, 0)
-                .unwrap()),
-        )
-        .single()
-        .unwrap()
-        .timestamp();
-
-    let account_key = recorder::current_account_key(connection)?;
-    let keys = account_key.clone().into_iter().collect::<Vec<_>>();
-    let turns = load_turns(connection, &keys, start, end)?;
-    let mut grouped: BTreeMap<(String, String, String), (i64, i64)> = BTreeMap::new();
-    for turn in turns {
-        let key = (
-            turn.model.unwrap_or_else(|| "unknown".into()),
-            turn.reasoning_effort,
-            turn.speed_mode,
-        );
-        let entry = grouped.entry(key).or_default();
-        entry.0 = entry.0.saturating_add(turn.raw_total_tokens.max(0));
-        entry.1 += 1;
-    }
-
-    let mut categories = grouped
-        .into_iter()
-        .map(
-            |((model, reasoning_effort, speed_mode), (raw_tokens, turn_count))| {
-                DailyModelUsageCategory {
-                    model,
-                    reasoning_effort,
-                    speed_mode,
-                    raw_tokens,
-                    turn_count,
-                }
-            },
-        )
-        .collect::<Vec<_>>();
-    categories.sort_by(|left, right| {
-        right
-            .raw_tokens
-            .cmp(&left.raw_tokens)
-            .then_with(|| left.model.cmp(&right.model))
-            .then_with(|| left.reasoning_effort.cmp(&right.reasoning_effort))
-            .then_with(|| left.speed_mode.cmp(&right.speed_mode))
-    });
-
-    let official_tokens = account_key
-        .as_deref()
-        .map(|account_key| {
-            connection
-                .query_row(
-                    "SELECT official_tokens FROM account_daily_usage
-                     WHERE account_key = ?1 AND date = ?2",
-                    params![account_key, date.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map(|value| value.map(|tokens| tokens.max(0)))
-                .map_err(|error| error.to_string())
-        })
-        .transpose()?
-        .flatten();
-
-    Ok(DailyModelUsage {
-        date: date.to_string(),
-        account_key,
-        official_tokens,
-        categories,
-        model_quota_attribution: "unavailable".into(),
-    })
-}
-
-pub fn app_daily_model_usage(
-    app: &tauri::AppHandle<tauri::Wry>,
-) -> Result<DailyModelUsage, String> {
-    let connection = db::open_database(app)?;
-    daily_model_usage(&connection)
-}
-
 pub fn query(
     connection: &Connection,
     request: &UsageAnalyticsQuery,
@@ -619,7 +527,7 @@ pub fn query(
                     let source = if key == "Unattributed" {
                         "official".into()
                     } else if value.attributed_quota_percent > 0.0 {
-                        "derived".into()
+                        PROVENANCE_DERIVED_ESTIMATE.into()
                     } else {
                         "local".into()
                     };
@@ -711,7 +619,7 @@ pub fn query(
             let source = if key == "Unattributed" {
                 "official".into()
             } else if value.attributed_quota_percent > 0.0 {
-                "derived".into()
+                PROVENANCE_DERIVED_ESTIMATE.into()
             } else {
                 "local".into()
             };
@@ -993,12 +901,13 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
         insert_account(&connection, "a");
-        insert_turn(&connection, "a", "t1", 1_786_694_450, 100);
+        insert_turn(&connection, "a", "t1", 1_786_694_550, 100);
         connection.execute(
             "INSERT INTO rate_limit_samples
              (account_key, sampled_at, limit_id, window, window_duration_mins, used_percent, resets_at, source, confidence)
              VALUES ('a', 1_786_694_400, 'codex', 'primary', 10080, 10, 99, 'official', 'high'),
-                    ('a', 1_786_694_500, 'codex', 'primary', 10080, 11, 99, 'official', 'high')",
+                    ('a', 1_786_694_500, 'codex', 'primary', 10080, 11, 99, 'official', 'high'),
+                    ('a', 1_786_694_600, 'codex', 'primary', 10080, 12, 99, 'official', 'high')",
             [],
         ).unwrap();
         quota::refresh_intervals(&connection, "a", "codex", "primary").unwrap();

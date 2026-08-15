@@ -3,6 +3,7 @@ import {
   useEffect,
   useMemo,
   useState,
+  type ReactNode,
 } from "react";
 
 import {
@@ -17,7 +18,7 @@ import type {
   CodexConnectionStatus,
   CodexAccountState,
   CodexSnapshot,
-  DailyModelUsage,
+  CategoryUsage,
   DailyUsageBucket,
   MonitorSettings,
   RateLimitsUpdatedPayload,
@@ -50,12 +51,14 @@ function QuotaCard({
   usedPercent,
   remainingPercent,
   resetsAt,
+  children,
 }: {
   limitName: string;
   title: string;
   usedPercent: number;
   remainingPercent: number;
   resetsAt: number | null;
+  children?: ReactNode;
 }) {
   const used =
     Math.max(
@@ -116,24 +119,210 @@ function QuotaCard({
           {formatReset(resetsAt)}
         </span>
       </div>
+
+      {children}
     </section>
   );
 }
 
-function DailyModelUsageCard({ reloadToken }: { reloadToken: number }) {
-  const [usage, setUsage] = useState<DailyModelUsage | null>(null);
+function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) {
+  const categories = usage?.categories ?? [];
+  const statusText = (status: string) => (
+    status === "estimated" ? "预估" : "参数过少，暂无法准确预估"
+  );
+
+  return (
+    <div className="quota-estimate-section">
+      <div className="quota-estimate-heading">
+        <h2>各模型预计完整周额度 Token 量</h2>
+      </div>
+
+      {usage?.periodSource === "insufficient_data" ? (
+        <p className="quota-estimate-warning">
+          未观测到可由 windowDurationMins + resetsAt 确认的当前 Codex 周额度窗口；严格周统计暂不使用自然周或最近 7 天回退数据。
+        </p>
+      ) : null}
+
+      {!categories.length ? (
+        <p className="muted small daily-model-usage-empty">
+          {usage ? "当前额度周期暂无本地 Turn Token 记录。" : "正在读取本额度周期…"}
+        </p>
+      ) : (
+        <div className="quota-estimate-list">
+          {categories.map((category) => {
+            const estimate = category.weeklyEstimate;
+            const estimated = estimate?.status === "estimated" && estimate.estimatedTokens != null;
+            return (
+              <div
+                className="quota-estimate-row"
+                key={`${category.model}:${category.reasoningEffort}:${category.speedMode}`}
+              >
+                <div className="daily-model-usage-label">
+                  <strong>
+                    {category.model}
+                    <span className="daily-model-usage-reasoning">
+                      ({category.reasoningEffort})
+                    </span>
+                    {category.fast ? <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span> : null}
+                  </strong>
+                  <span className="muted tiny">
+                    {category.turnCount} 个 Turn · {formatNumber(category.tokens)} real tokens
+                  </span>
+                </div>
+                <div className="daily-model-usage-values">
+                  <strong>{estimated ? `≈ ${formatNumber(estimate.estimatedTokens!)} tokens` : statusText(estimate?.status ?? "insufficient_data")}</strong>
+                  {estimated ? (
+                    <span className="muted tiny">预估 · {estimate!.validSampleCount} 个有效额度样本 · {estimate!.confidence} confidence</span>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="quota-estimate-divider" />
+      <div className="quota-estimate-remaining">
+        <div>
+          <h2>预计剩余可使用 Token</h2>
+          <span className="muted tiny">按账号真实剩余周额度 × 已建立的分类预估模型</span>
+        </div>
+        <div className="quota-estimate-remaining-list">
+          {categories.length ? categories.map((category) => {
+            const estimate = category.weeklyEstimate;
+            const remaining = estimate?.status === "estimated" && estimate.remainingTokens != null;
+            return (
+              <div className="quota-estimate-remaining-row" key={`${category.model}:${category.reasoningEffort}:${category.speedMode}`}>
+                <span>
+                  {category.model} ({category.reasoningEffort})
+                  {category.fast ? <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span> : null}
+                </span>
+                <strong>{remaining ? `≈ ${formatNumber(estimate.remainingTokens!)} tokens` : statusText(estimate?.status ?? "insufficient_data")}</strong>
+              </div>
+            );
+          }) : (
+            <span className="muted tiny">参数过少，暂无法准确预估</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TodayCodexUsageCard({
+  usage,
+  loading,
+}: {
+  usage: CategoryUsage | null;
+  loading: boolean;
+}) {
+  const quota = usage?.quotaUsage;
+  const tokenUsage = usage?.tokenUsage;
+  const quotaObserved = quota?.status === "observed" && quota.value != null;
+  const formatObservedQuota = quotaObserved
+    ? `${quota!.value!.toFixed(2)}%`
+    : usage
+      ? "参数过少，暂无法准确观测"
+      : "—";
+
+  return (
+    <section className="quota-card daily-model-usage-card">
+      <div className="row quota-head">
+        <div>
+          <div className="eyebrow">Usage · Local calendar day</div>
+          <h2>今日 Codex 使用情况</h2>
+        </div>
+        <div className="muted tiny">{loading ? "同步中…" : `${usage?.categories.length ?? 0} 类`}</div>
+      </div>
+
+      <div className="usage-account-metrics">
+        <div className="usage-account-metric">
+          <span className="eyebrow">今日消耗周额度量</span>
+          <strong>{formatObservedQuota}</strong>
+          <span className="muted tiny">
+            {quotaObserved
+              ? `Observed · ${quota!.sampleCount} 个 rateLimits 变化样本`
+              : usage
+                ? "Insufficient data · 仅接受真实 rateLimits 变化"
+                : "正在读取真实 rateLimits 样本…"}
+          </span>
+        </div>
+        <div className="usage-account-metric">
+          <span className="eyebrow">今日消耗 Token 量</span>
+          <strong>{usage ? formatNumber(tokenUsage?.valueTokens ?? 0) : "—"}</strong>
+          <span className="muted tiny">
+            {usage ? `Observed · ${tokenUsage?.sampleCount ?? 0} 个本地 Turn` : "正在读取本地 JSONL / rollout…"}
+          </span>
+        </div>
+      </div>
+
+      {!usage?.categories.length ? (
+        <p className="muted small daily-model-usage-empty">
+          {loading ? "正在读取今日分类用量…" : "今日暂无可用的本地 Turn Token 数据。"}
+        </p>
+      ) : (
+        <div className="daily-model-usage-list">
+          {usage.categories.map((category) => (
+            <div
+              className="daily-model-usage-row"
+              key={`${category.model}:${category.reasoningEffort}:${category.speedMode}`}
+            >
+              <div className="daily-model-usage-label">
+                <strong>
+                  {category.model}
+                  <span className="daily-model-usage-reasoning">({category.reasoningEffort})</span>
+                  {category.fast ? <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span> : null}
+                </strong>
+                <span className="muted tiny">{category.turnCount} 个 Turn</span>
+              </div>
+              <div className="daily-model-usage-values">
+                <strong>{formatNumber(category.tokens)} tokens</strong>
+                <span className="muted tiny">Token 来源：本地 JSONL / rollout</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="daily-model-usage-footnote muted tiny">
+        今日额度量仅显示账号级 Observed rateLimits 变化；没有将 Token 占比反推为模型额度。
+      </div>
+    </section>
+  );
+}
+
+function HomeUsageBreakdown({
+  reloadToken,
+  weeklyQuota,
+}: {
+  reloadToken: number;
+  weeklyQuota: {
+    id: string;
+    limitName: string;
+    label: string;
+    usedPercent: number;
+    remainingPercent: number;
+    resetsAt: number | null;
+  } | null;
+}) {
+  const [todayUsage, setTodayUsage] = useState<CategoryUsage | null>(null);
+  const [weeklyUsage, setWeeklyUsage] = useState<CategoryUsage | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     let disposed = false;
     setLoading(true);
-    void invoke<DailyModelUsage>("get_daily_model_usage")
-      .then((value) => {
+    void Promise.all([
+      invoke<CategoryUsage>("get_category_usage", { period: "day" }),
+      invoke<CategoryUsage>("get_category_usage", { period: "quota_week" }),
+    ])
+      .then(([today, weekly]) => {
         if (!disposed) {
-          setUsage(value);
+          setTodayUsage(today);
+          setWeeklyUsage(weekly);
         }
       })
-      .catch((error) => console.error("[UI] daily model usage load failed:", error))
+      .catch((error) => console.error("[UI] homepage usage load failed:", error))
       .finally(() => {
         if (!disposed) {
           setLoading(false);
@@ -145,65 +334,27 @@ function DailyModelUsageCard({ reloadToken }: { reloadToken: number }) {
   }, [reloadToken]);
 
   return (
-    <section className="quota-card daily-model-usage-card">
-      <div className="row quota-head">
-        <div>
-          <div className="eyebrow">Today · Local Turn Token</div>
-          <h2>当日消耗额度 token 用量（周额度消耗量）</h2>
-        </div>
-        <div className="muted tiny">
-          {loading ? "采集中…" : `${usage?.categories.length ?? 0} 类`}
-        </div>
-      </div>
-
-      <div className="daily-model-usage-notice">
-        <strong>周额度按账号聚合</strong>
-        <span>
-          Codex 当前接口没有返回模型级周额度消耗，以下 Token 为本地逐 Turn 的真实记录；不对模型强行分摊额度。
-        </span>
-      </div>
-
-      {!usage?.categories.length ? (
-        <p className="muted small daily-model-usage-empty">
-          今日暂无可用的本地 Turn Token 数据。
-        </p>
+    <div className="quota-grid weekly-quota-row">
+      {weeklyQuota ? (
+        <QuotaCard
+          limitName={weeklyQuota.limitName}
+          title={weeklyQuota.label}
+          usedPercent={weeklyQuota.usedPercent}
+          remainingPercent={weeklyQuota.remainingPercent}
+          resetsAt={weeklyQuota.resetsAt}
+        >
+          <WeeklyTokenEstimateSection usage={weeklyUsage} />
+        </QuotaCard>
       ) : (
-        <div className="daily-model-usage-list">
-          {usage.categories.map((category) => {
-            const isFast = category.speedMode === "fast_requested";
-            return (
-              <div
-                className="daily-model-usage-row"
-                key={`${category.model}:${category.reasoningEffort}:${category.speedMode}`}
-              >
-                <div className="daily-model-usage-label">
-                  <strong>
-                    {category.model}
-                    <span className="daily-model-usage-reasoning">
-                      ({category.reasoningEffort})
-                    </span>
-                    {isFast ? (
-                      <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span>
-                    ) : null}
-                  </strong>
-                  <span className="muted tiny">{category.turnCount} 个 Turn</span>
-                </div>
-                <div className="daily-model-usage-values">
-                  <strong>{formatNumber(category.rawTokens)} tokens</strong>
-                  <span className="muted tiny">周额度：无法精确归因</span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <section className="quota-card">
+          <div className="eyebrow">Weekly quota</div>
+          <h2>周额度</h2>
+          <p className="muted small">未返回当前账号的周额度窗口，无法显示账号级剩余百分比。</p>
+          <WeeklyTokenEstimateSection usage={weeklyUsage} />
+        </section>
       )}
-
-      {usage?.officialTokens != null ? (
-        <div className="daily-model-usage-footnote muted tiny">
-          官方账号当日总量：{formatNumber(usage.officialTokens)} tokens；它不包含模型级额度分配。
-        </div>
-      ) : null}
-    </section>
+      <TodayCodexUsageCard usage={todayUsage} loading={loading} />
+    </div>
   );
 }
 
@@ -422,8 +573,8 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
     <section className="chart-card analytics-card">
       <div className="row analytics-heading">
         <div>
-          <div className="eyebrow">Token Activity</div>
-          <h2>本地 Codex 使用分析</h2>
+          <div className="eyebrow">Experimental Local Analysis</div>
+          <h2>本地 Codex 使用分析（实验性）</h2>
         </div>
         <div className="muted tiny">
           {loading ? "分析中…" : `${analytics?.turnCount ?? 0} 个 Turn`}
@@ -503,7 +654,7 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
             ))}
           </div>
           <div className="analytics-footnote muted tiny">
-            Official total is the account-level source. Local rollout data is only used for attribution; missing portions are shown as Unattributed. Any category quota values here are derived estimates, not official model-level billing. Cached input and reasoning are telemetry categories, not extra billing totals.
+            此旧版分析仅用于本地 Token 活动与实验性 derived estimate，不进入上方官方额度或模型 Credits 卡片。官方账号总量与本机 rollout 观测保持分开；分类周额度不会在这里推算。
           </div>
         </>
       )}
@@ -1601,27 +1752,10 @@ function App() {
                 </div>
               ) : null}
 
-              {weeklyQuotaWindows.length > 0 ? (
-                <div className="quota-grid weekly-quota-row">
-                  {weeklyQuotaWindows.map((quota) => (
-                    <QuotaCard
-                      key={quota.id}
-                      limitName={quota.limitName}
-                      title={quota.label}
-                      usedPercent={quota.usedPercent}
-                      remainingPercent={quota.remainingPercent}
-                      resetsAt={quota.resetsAt}
-                    />
-                  ))}
-                  <DailyModelUsageCard reloadToken={analyticsReloadToken} />
-                </div>
-              ) : (
-                !loading && (
-                  <section className="error-card">
-                    <strong>未返回速率限制数据。</strong>
-                  </section>
-                )
-              )}
+              <HomeUsageBreakdown
+                reloadToken={analyticsReloadToken}
+                weeklyQuota={weeklyQuotaWindows[0] ?? null}
+              />
 
               <UsageAnalyticsPanel reloadToken={analyticsReloadToken} />
 

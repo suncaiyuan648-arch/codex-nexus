@@ -190,17 +190,23 @@ fn process_line(
                 .get("total_token_usage")
                 .map(parse_usage)
                 .unwrap_or_default();
-            let last = info.get("last_token_usage").map(parse_usage);
-            let usage = if let Some(last) = last.filter(|usage| usage.raw_total_tokens > 0) {
-                last
-            } else {
-                subtract(&total, &state.turn_start_totals)
-            };
             let reset_baseline = total.raw_total_tokens < state.last_totals.raw_total_tokens;
             if reset_baseline {
                 state.turn_start_totals = TokenUsage::default();
             }
-            state.last_totals = total;
+            // `last_token_usage` is not a reliable delta: Codex can re-emit
+            // the previous value when only rate-limit state changes. The
+            // cumulative total is the source of truth. If the cumulative
+            // total did not grow, keep the previous normalized total so a
+            // repeated event cannot create a new usage observation.
+            let effective_total =
+                if reset_baseline || total.raw_total_tokens > state.last_totals.raw_total_tokens {
+                    total
+                } else {
+                    state.last_totals.clone()
+                };
+            let usage = subtract(&effective_total, &state.turn_start_totals);
+            state.last_totals = effective_total;
 
             let thread_id = state
                 .thread_id
@@ -471,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn last_turn_usage_is_preferred_when_available() {
+    fn cumulative_total_wins_over_stale_last_turn_usage() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
         let mut state = CursorState {
@@ -489,6 +495,42 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(total, 7);
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn repeated_cumulative_total_does_not_use_stale_last_turn_usage() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let mut state = CursorState {
+            session_id: Some("s".into()),
+            thread_id: Some("th".into()),
+            turn_id: Some("t".into()),
+            model: Some("gpt-5.6-luna".into()),
+            reasoning_effort: Some("medium".into()),
+            speed_mode: Some("standard".into()),
+            ..CursorState::default()
+        };
+        for last in [7, 9] {
+            let line = serde_json::json!({
+                "timestamp": "2026-08-14T00:00:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": { "input_tokens": 100, "total_tokens": 100 },
+                        "last_token_usage": { "input_tokens": last, "total_tokens": last }
+                    }
+                }
+            })
+            .to_string();
+            process_line(&connection, &line, &mut state, "a").unwrap();
+        }
+        let total: i64 = connection
+            .query_row("SELECT raw_total_tokens FROM turn_usage", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(total, 100);
     }
 }

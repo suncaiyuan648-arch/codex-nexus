@@ -3,7 +3,13 @@ use std::collections::BTreeMap;
 
 pub const SOURCE_OFFICIAL: &str = "official";
 pub const SOURCE_ROLLOUT: &str = "rollout";
-pub const SOURCE_APP_SERVER: &str = "app-server";
+pub const PROVENANCE_LOCAL_ROLLOUT: &str = "local_rollout";
+pub const PROVENANCE_APP_SERVER_THREAD_USAGE: &str = "app_server_thread_usage";
+pub const PROVENANCE_ACCOUNT_RATE_LIMIT: &str = "account_rate_limit";
+pub const PROVENANCE_DERIVED_ESTIMATE: &str = "derived_estimate";
+pub const USAGE_STATUS_OBSERVED: &str = "observed";
+pub const USAGE_STATUS_ESTIMATED: &str = "estimated";
+pub const USAGE_STATUS_INSUFFICIENT_DATA: &str = "insufficient_data";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -23,25 +29,89 @@ pub enum AccountScope {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DailyModelUsageCategory {
+pub struct CategoryUsageItem {
     pub model: String,
     pub reasoning_effort: String,
     pub speed_mode: String,
-    pub raw_tokens: i64,
+    pub fast: bool,
     pub turn_count: i64,
+    pub tokens: i64,
+    pub token_source: String,
+    pub server_estimated_credits_micros: Option<i64>,
+    pub credit_source: String,
+    /// Codex only exposes quota percentages at account/window level. This is
+    /// intentionally never derived from tokens or server credits.
+    pub weekly_quota_percent: Option<f64>,
+    pub weekly_estimate: Option<CategoryTokenEstimate>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DailyModelUsage {
-    pub date: String,
+pub struct CategoryTokenEstimate {
+    pub status: String,
+    pub estimated_tokens: Option<i64>,
+    pub remaining_tokens: Option<i64>,
+    pub observed_sample_count: i64,
+    pub valid_sample_count: i64,
+    pub observed_tokens: i64,
+    pub observed_quota_percent: f64,
+    pub cumulative_observed_quota_delta: f64,
+    pub coverage_ratio: f64,
+    pub pending_tokens: i64,
+    pub rejected_sample_count: i64,
+    pub boundary_overlap_ratio: f64,
+    pub dispersion_ratio: f64,
+    pub external_usage_risk: bool,
+    pub confidence: Confidence,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageMetric {
+    pub status: String,
+    pub value: Option<f64>,
+    pub sample_count: i64,
+    pub confidence: Confidence,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageMetric {
+    pub status: String,
+    pub value_tokens: i64,
+    pub sample_count: i64,
+    pub confidence: Confidence,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryUsageQuotaWindow {
+    pub limit_id: String,
+    pub window: String,
+    pub used_percent: f64,
+    pub remaining_percent: f64,
+    pub window_duration_mins: i64,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryUsage {
+    pub period: String,
+    pub period_start: i64,
+    pub period_end: i64,
+    pub period_source: String,
     pub account_key: Option<String>,
     pub official_tokens: Option<i64>,
-    pub categories: Vec<DailyModelUsageCategory>,
-    /// The current Codex RPCs expose weekly quota at account/window level only.
-    /// This field intentionally stays explicit instead of allocating quota to
-    /// model categories with a local price/rate-card heuristic.
-    pub model_quota_attribution: String,
+    pub local_tokens: i64,
+    pub server_usage_capability: String,
+    pub quota_window: Option<CategoryUsageQuotaWindow>,
+    pub quota_usage: Option<UsageMetric>,
+    pub token_usage: TokenUsageMetric,
+    pub categories: Vec<CategoryUsageItem>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

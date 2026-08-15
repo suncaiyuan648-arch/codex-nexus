@@ -23,6 +23,22 @@ pub fn open_database(app: &AppHandle<Wry>) -> Result<Connection, String> {
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(|error| error.to_string())?;
     initialize_schema(&connection)?;
+    // quota_intervals is derived data. Rebuild it from the immutable raw
+    // samples once when upgrading legacy adjacent-sample rows; new samples
+    // are rebuilt synchronously by recorder::record_rate_limit_samples.
+    let needs_rebuild: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM quota_intervals
+               WHERE window_duration_mins = 0 OR sample_quality = 'legacy'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if needs_rebuild {
+        super::quota::rebuild_all_intervals(&connection)?;
+    }
     Ok(connection)
 }
 
@@ -75,6 +91,36 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 PRIMARY KEY (account_key, date)
             );
 
+            CREATE TABLE IF NOT EXISTS thread_usage_group_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_key TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                sampled_at INTEGER NOT NULL,
+                model TEXT,
+                reasoning_effort TEXT NOT NULL,
+                speed_mode TEXT NOT NULL,
+                estimated_usage_credits_micros INTEGER NOT NULL,
+                estimated_usage_usd_micros INTEGER,
+                net_new_input_tokens INTEGER,
+                cached_input_tokens INTEGER,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                total_tokens INTEGER,
+                source TEXT NOT NULL,
+                confidence TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS thread_usage_capabilities (
+                account_key TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                last_attempted_at INTEGER NOT NULL,
+                last_sampled_at INTEGER,
+                capability TEXT NOT NULL,
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (account_key, thread_id)
+            );
+
             CREATE TABLE IF NOT EXISTS rate_limit_samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_key TEXT NOT NULL,
@@ -94,6 +140,10 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 account_key TEXT NOT NULL,
                 limit_id TEXT NOT NULL,
                 window TEXT NOT NULL,
+                window_duration_mins INTEGER NOT NULL DEFAULT 0,
+                cycle_id TEXT NOT NULL DEFAULT 'reset:unknown',
+                start_sample_id INTEGER,
+                end_sample_id INTEGER,
                 start_at INTEGER NOT NULL,
                 end_at INTEGER NOT NULL,
                 start_percent REAL NOT NULL,
@@ -101,6 +151,8 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 observed_delta_percent REAL NOT NULL,
                 local_weighted_credits REAL,
                 unattributed_percent REAL,
+                sample_quality TEXT NOT NULL DEFAULT 'quota_step',
+                rejection_reason TEXT,
                 confidence TEXT NOT NULL
             );
 
@@ -116,13 +168,49 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 ON turn_usage(account_key, started_at);
             CREATE INDEX IF NOT EXISTS idx_account_daily_usage_date
                 ON account_daily_usage(account_key, date);
+            CREATE INDEX IF NOT EXISTS idx_thread_usage_group_samples_time
+                ON thread_usage_group_samples(account_key, thread_id, sampled_at, id);
+            CREATE INDEX IF NOT EXISTS idx_thread_usage_capabilities_time
+                ON thread_usage_capabilities(account_key, last_attempted_at);
             CREATE INDEX IF NOT EXISTS idx_rate_limit_samples_time
                 ON rate_limit_samples(account_key, limit_id, window, sampled_at);
             CREATE INDEX IF NOT EXISTS idx_quota_intervals_time
                 ON quota_intervals(account_key, limit_id, window, start_at, end_at);
             ",
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    if table_exists(connection, "thread_usage_capabilities")?
+        && !has_column(connection, "thread_usage_capabilities", "retry_count")?
+    {
+        connection
+            .execute(
+                "ALTER TABLE thread_usage_capabilities
+                 ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for (column, definition) in [
+        ("window_duration_mins", "INTEGER NOT NULL DEFAULT 0"),
+        ("cycle_id", "TEXT NOT NULL DEFAULT 'reset:unknown'"),
+        ("start_sample_id", "INTEGER"),
+        ("end_sample_id", "INTEGER"),
+        ("sample_quality", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("rejection_reason", "TEXT"),
+    ] {
+        if table_exists(connection, "quota_intervals")?
+            && !has_column(connection, "quota_intervals", column)?
+        {
+            connection
+                .execute(
+                    &format!("ALTER TABLE quota_intervals ADD COLUMN {column} {definition}"),
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
@@ -307,6 +395,8 @@ mod tests {
             "accounts",
             "turn_usage",
             "account_daily_usage",
+            "thread_usage_group_samples",
+            "thread_usage_capabilities",
             "rate_limit_samples",
             "quota_intervals",
             "rollout_cursors",

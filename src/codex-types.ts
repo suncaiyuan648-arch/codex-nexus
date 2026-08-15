@@ -150,20 +150,81 @@ export interface UsageSchedulerStatus {
   lastLocalActivityAt: number | null;
 }
 
-export interface DailyModelUsageCategory {
+export type CategoryUsagePeriod = "day" | "quota_week";
+export type ServerUsageCapability = "available" | "unavailable" | "syncing";
+export type UsageDataStatus = "observed" | "estimated" | "insufficient_data";
+
+export interface UsageMetric {
+  status: UsageDataStatus;
+  value: number | null;
+  sampleCount: number;
+  confidence: UsageConfidence;
+  source: string;
+}
+
+export interface TokenUsageMetric {
+  status: UsageDataStatus;
+  valueTokens: number;
+  sampleCount: number;
+  confidence: UsageConfidence;
+  source: string;
+}
+
+export interface CategoryTokenEstimate {
+  status: UsageDataStatus;
+  estimatedTokens: number | null;
+  remainingTokens: number | null;
+  observedSampleCount: number;
+  validSampleCount: number;
+  observedTokens: number;
+  observedQuotaPercent: number;
+  cumulativeObservedQuotaDelta: number;
+  coverageRatio: number;
+  pendingTokens: number;
+  rejectedSampleCount: number;
+  boundaryOverlapRatio: number;
+  dispersionRatio: number;
+  externalUsageRisk: boolean;
+  confidence: UsageConfidence;
+  source: string;
+}
+
+export interface CategoryUsageItem {
   model: string;
   reasoningEffort: string;
   speedMode: "standard" | "fast_requested" | "unknown";
-  rawTokens: number;
+  fast: boolean;
   turnCount: number;
+  tokens: number;
+  tokenSource: "local_rollout";
+  serverEstimatedCreditsMicros: number | null;
+  creditSource: "app_server" | "unavailable";
+  weeklyQuotaPercent: number | null;
+  weeklyEstimate: CategoryTokenEstimate | null;
 }
 
-export interface DailyModelUsage {
-  date: string;
+export interface CategoryUsageQuotaWindow {
+  limitId: string;
+  window: string;
+  usedPercent: number;
+  remainingPercent: number;
+  windowDurationMins: number;
+  resetsAt: number | null;
+}
+
+export interface CategoryUsage {
+  period: CategoryUsagePeriod;
+  periodStart: number;
+  periodEnd: number;
+  periodSource: "local_day" | "quota_window" | "insufficient_data";
   accountKey: string | null;
   officialTokens: number | null;
-  categories: DailyModelUsageCategory[];
-  modelQuotaAttribution: "unavailable";
+  localTokens: number;
+  serverUsageCapability: ServerUsageCapability;
+  quotaWindow: CategoryUsageQuotaWindow | null;
+  quotaUsage: UsageMetric | null;
+  tokenUsage: TokenUsageMetric;
+  categories: CategoryUsageItem[];
 }
 
 export interface HistoryLimit {
@@ -184,7 +245,7 @@ export interface UsageHistoryEntry {
 export type UsageRange = "7d" | "15d" | "30d" | "90d" | "all";
 export type UsageBreakdown = "model" | "reasoning" | "speed" | "tokenType";
 
-export type UsageSource = "official" | "local" | "derived" | "estimated";
+export type UsageSource = "official" | "local" | "derived" | "derived_estimate" | "estimated";
 export type UsageConfidence = "high" | "medium" | "low" | "unknown";
 
 export type UsageAccountScope =
