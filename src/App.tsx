@@ -3,7 +3,6 @@ import {
   useEffect,
   useMemo,
   useState,
-  useRef,
 } from "react";
 
 import {
@@ -15,12 +14,17 @@ import {
 } from "@tauri-apps/api/event";
 
 import type {
-  AccountUpdatedPayload,
   CodexConnectionStatus,
   CodexAccountState,
   CodexSnapshot,
+  DailyModelUsage,
   DailyUsageBucket,
+  MonitorSettings,
   RateLimitsUpdatedPayload,
+  UsageAnalytics,
+  UsageBreakdown,
+  UsageRange,
+  UsageSchedulerStatus,
 } from "./codex-types";
 
 import {
@@ -41,15 +45,17 @@ import codexIconBody from "../assets/branding/app/app-icon-master.png";
  * ============================================================
  */
 function QuotaCard({
+  limitName,
   title,
   usedPercent,
   remainingPercent,
   resetsAt,
 }: {
+  limitName: string;
   title: string;
   usedPercent: number;
   remainingPercent: number;
-  resetsAt: number;
+  resetsAt: number | null;
 }) {
   const used =
     Math.max(
@@ -74,7 +80,7 @@ function QuotaCard({
       <div className="row quota-head">
         <div>
           <div className="eyebrow">
-            速率限制
+            {limitName}
           </div>
 
           <h2>
@@ -110,6 +116,397 @@ function QuotaCard({
           {formatReset(resetsAt)}
         </span>
       </div>
+    </section>
+  );
+}
+
+function DailyModelUsageCard({ reloadToken }: { reloadToken: number }) {
+  const [usage, setUsage] = useState<DailyModelUsage | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+    void invoke<DailyModelUsage>("get_daily_model_usage")
+      .then((value) => {
+        if (!disposed) {
+          setUsage(value);
+        }
+      })
+      .catch((error) => console.error("[UI] daily model usage load failed:", error))
+      .finally(() => {
+        if (!disposed) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [reloadToken]);
+
+  return (
+    <section className="quota-card daily-model-usage-card">
+      <div className="row quota-head">
+        <div>
+          <div className="eyebrow">Today · Local Turn Token</div>
+          <h2>当日消耗额度 token 用量（周额度消耗量）</h2>
+        </div>
+        <div className="muted tiny">
+          {loading ? "采集中…" : `${usage?.categories.length ?? 0} 类`}
+        </div>
+      </div>
+
+      <div className="daily-model-usage-notice">
+        <strong>周额度按账号聚合</strong>
+        <span>
+          Codex 当前接口没有返回模型级周额度消耗，以下 Token 为本地逐 Turn 的真实记录；不对模型强行分摊额度。
+        </span>
+      </div>
+
+      {!usage?.categories.length ? (
+        <p className="muted small daily-model-usage-empty">
+          今日暂无可用的本地 Turn Token 数据。
+        </p>
+      ) : (
+        <div className="daily-model-usage-list">
+          {usage.categories.map((category) => {
+            const isFast = category.speedMode === "fast_requested";
+            return (
+              <div
+                className="daily-model-usage-row"
+                key={`${category.model}:${category.reasoningEffort}:${category.speedMode}`}
+              >
+                <div className="daily-model-usage-label">
+                  <strong>
+                    {category.model}
+                    <span className="daily-model-usage-reasoning">
+                      ({category.reasoningEffort})
+                    </span>
+                    {isFast ? (
+                      <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span>
+                    ) : null}
+                  </strong>
+                  <span className="muted tiny">{category.turnCount} 个 Turn</span>
+                </div>
+                <div className="daily-model-usage-values">
+                  <strong>{formatNumber(category.rawTokens)} tokens</strong>
+                  <span className="muted tiny">周额度：无法精确归因</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {usage?.officialTokens != null ? (
+        <div className="daily-model-usage-footnote muted tiny">
+          官方账号当日总量：{formatNumber(usage.officialTokens)} tokens；它不包含模型级额度分配。
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+const NOTIFICATION_THRESHOLDS = [80, 90, 95, 100];
+
+function SettingsPanel({
+  settings,
+  saving,
+  onChange,
+  schedulerStatus,
+}: {
+  settings: MonitorSettings;
+  saving: boolean;
+  onChange: (next: MonitorSettings) => void;
+  schedulerStatus: UsageSchedulerStatus | null;
+}) {
+  const toggleThreshold = (threshold: number) => {
+    const current = new Set(settings.notifyThresholds);
+    if (current.has(threshold)) {
+      current.delete(threshold);
+    } else {
+      current.add(threshold);
+    }
+
+    onChange({
+      ...settings,
+      notifyThresholds: [...current].sort((a, b) => a - b),
+    });
+  };
+
+  return (
+    <section className="settings-card">
+      <div className="row settings-heading">
+        <div>
+          <div className="eyebrow">设置</div>
+          <h2>监控与通知</h2>
+        </div>
+        <div className="muted tiny">
+          {saving
+            ? "保存中…"
+            : schedulerStatus
+              ? `${schedulerStatus.watcherActive ? "实时监听" : "周期校准"} · ${schedulerStatus.policy}`
+              : "已保存到本机"}
+        </div>
+      </div>
+
+      <div className="settings-group">
+        <div className="eyebrow">Notify me at</div>
+        <div className="threshold-grid">
+          {NOTIFICATION_THRESHOLDS.map((threshold) => (
+            <label className="check-pill" key={threshold}>
+              <input
+                type="checkbox"
+                checked={settings.notifyThresholds.includes(threshold)}
+                onChange={() => toggleThreshold(threshold)}
+              />
+              <span>{threshold}%</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <label className="setting-row">
+        <span>
+          <strong>Quota reset notifications</strong>
+          <small>额度窗口重置后通知一次，并清空该窗口的阈值去重状态。</small>
+        </span>
+        <input
+          type="checkbox"
+          checked={settings.notifyQuotaReset}
+          onChange={(event) => onChange({
+            ...settings,
+            notifyQuotaReset: event.target.checked,
+          })}
+        />
+      </label>
+
+      <div className="settings-group">
+        <div className="eyebrow">Usage refresh</div>
+        <label className="setting-row">
+          <span>
+            <strong>Refresh policy</strong>
+            <small>事件驱动采集本地 Turn Token，周期校准由 Rust 调度器负责。</small>
+          </span>
+          <select
+            value={settings.usageRefreshPolicy === "5s" ? "adaptive" : settings.usageRefreshPolicy}
+            onChange={(event) => onChange({
+              ...settings,
+              usageRefreshPolicy: event.target.value,
+            })}
+          >
+            <option value="adaptive">Adaptive Realtime (Experimental)</option>
+            <option value="15s">15s</option>
+            <option value="30s">30s</option>
+            <option value="1m">1m</option>
+            <option value="3m">3m</option>
+            <option value="5m">5m</option>
+          </select>
+        </label>
+        <details>
+          <summary>Advanced</summary>
+          <label className="setting-row">
+            <span>
+              <strong>5s fallback</strong>
+              <small>仅用于短时诊断，后台仍由 Rust Scheduler 管理。</small>
+            </span>
+            <select
+              value={settings.usageRefreshPolicy === "5s" ? "5s" : ""}
+              onChange={(event) => onChange({
+                ...settings,
+                usageRefreshPolicy: event.target.value || "adaptive",
+              })}
+            >
+              <option value="">Disabled</option>
+              <option value="5s">5s</option>
+            </select>
+          </label>
+        </details>
+      </div>
+
+      <label className="setting-row">
+        <span>
+          <strong>Launch at startup</strong>
+          <small>使用系统启动项启动后台监控。</small>
+        </span>
+        <input
+          type="checkbox"
+          checked={settings.launchAtStartup}
+          onChange={(event) => onChange({
+            ...settings,
+            launchAtStartup: event.target.checked,
+          })}
+        />
+      </label>
+
+      <label className="setting-row">
+        <span>
+          <strong>Start minimized</strong>
+          <small>启动后隐藏主窗口，只保留托盘监控。</small>
+        </span>
+        <input
+          type="checkbox"
+          checked={settings.startMinimized}
+          onChange={(event) => onChange({
+            ...settings,
+            startMinimized: event.target.checked,
+          })}
+        />
+      </label>
+
+      <label className="setting-row">
+        <span>
+          <strong>Close window to tray</strong>
+          <small>点击窗口 X 时隐藏窗口，真正退出请使用托盘菜单。</small>
+        </span>
+        <input
+          type="checkbox"
+          checked={settings.closeToTray}
+          onChange={(event) => onChange({
+            ...settings,
+            closeToTray: event.target.checked,
+          })}
+        />
+      </label>
+    </section>
+  );
+}
+
+const USAGE_RANGES: Array<{ value: UsageRange; label: string }> = [
+  { value: "7d", label: "7D" },
+  { value: "15d", label: "15D" },
+  { value: "30d", label: "30D" },
+  { value: "90d", label: "90D" },
+  { value: "all", label: "ALL" },
+];
+
+const USAGE_BREAKDOWNS: Array<{ value: UsageBreakdown; label: string }> = [
+  { value: "model", label: "Model" },
+  { value: "reasoning", label: "Reasoning" },
+  { value: "speed", label: "Speed" },
+  { value: "tokenType", label: "Token type" },
+];
+
+const ANALYTICS_COLORS = ["#007aff", "#5ac8fa", "#34c759", "#ff9f0a", "#af52de", "#ff375f", "#8e8e93"];
+
+function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
+  const [range, setRange] = useState<UsageRange>("7d");
+  const [breakdown, setBreakdown] = useState<UsageBreakdown>("model");
+  const [analytics, setAnalytics] = useState<UsageAnalytics | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+    void invoke<UsageAnalytics>("get_usage_analytics", { range, breakdown })
+      .then((value) => {
+        if (!disposed) setAnalytics(value);
+      })
+      .catch((error) => console.error("[UI] analytics load failed:", error))
+      .finally(() => {
+        if (!disposed) setLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [range, breakdown, reloadToken]);
+
+  const maxValue = Math.max(
+    1,
+    ...(analytics?.points ?? []).map((point) =>
+      Object.values(point.categoryValues).reduce((sum, value) => sum + value, 0),
+    ),
+  );
+
+  return (
+    <section className="chart-card analytics-card">
+      <div className="row analytics-heading">
+        <div>
+          <div className="eyebrow">Token Activity</div>
+          <h2>本地 Codex 使用分析</h2>
+        </div>
+        <div className="muted tiny">
+          {loading ? "分析中…" : `${analytics?.turnCount ?? 0} 个 Turn`}
+        </div>
+      </div>
+
+      <div className="analytics-controls">
+        <div className="segmented-control">
+          {USAGE_RANGES.map((item) => (
+            <button
+              key={item.value}
+              className={range === item.value ? "active" : ""}
+              onClick={() => setRange(item.value)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+        <label className="breakdown-select">
+          <span className="muted tiny">Breakdown by</span>
+          <select value={breakdown} onChange={(event) => setBreakdown(event.target.value as UsageBreakdown)}>
+            {USAGE_BREAKDOWNS.map((item) => (
+              <option key={item.value} value={item.value}>{item.label}</option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {analytics?.estimatedRemainingTokens != null ? (
+        <div className="estimate-card">
+          <div>
+            <div className="eyebrow">Estimated Remaining</div>
+            <strong>≈ {formatNumber(analytics.estimatedRemainingTokens)} tokens</strong>
+          </div>
+          <span className="muted tiny">
+            根据最近 {analytics.estimateSampleCount} 个有效额度区间估算
+          </span>
+        </div>
+      ) : null}
+
+      {!analytics?.points.length ? (
+        <p className="muted small analytics-empty">
+          暂无 SQLite 分析数据。首次采集后会保留官方每日总量、本机 Turn 明细和无法归因的用量。
+        </p>
+      ) : (
+        <>
+          <div className="stacked-chart" aria-label="Token activity stacked bar chart">
+            {analytics.points.map((point) => {
+              const values = Object.entries(point.categoryValues);
+              return (
+                <div className="stacked-chart-col" key={point.date} title={`${point.date} · ${formatNumber(point.officialTokens ?? point.localTokens)} token`}>
+                  <div className="stacked-chart-value">{formatNumber(point.officialTokens ?? point.localTokens)}</div>
+                  <div className="stacked-chart-track">
+                    {values.map(([category, value], index) => (
+                      <div
+                        className="stacked-chart-segment"
+                        key={category}
+                        style={{
+                          height: `${Math.max(1, (value / maxValue) * 100)}%`,
+                          background: ANALYTICS_COLORS[index % ANALYTICS_COLORS.length],
+                        }}
+                        title={`${category}: ${formatNumber(value)}`}
+                      />
+                    ))}
+                  </div>
+                  <div className="tiny muted">{point.date.slice(5)}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="analytics-legend">
+            {analytics.categories.map((category, index) => (
+              <span key={category}>
+                <i style={{ background: ANALYTICS_COLORS[index % ANALYTICS_COLORS.length] }} />
+                {category}
+              </span>
+            ))}
+          </div>
+          <div className="analytics-footnote muted tiny">
+            Official total is the account-level source. Local rollout data is only used for attribution; missing portions are shown as Unattributed. Any category quota values here are derived estimates, not official model-level billing. Cached input and reasoning are telemetry categories, not extra billing totals.
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -297,25 +694,6 @@ function App() {
     CodexConnectionStatus | null
   >(null);
 
-  /*
-   * 防止同一个 generation
-   * 重复触发 refresh。
-   *
-   * generation 1 Ready
-   *      ↓
-   * refresh()
-   *
-   * generation 1 Ready 再次通知
-   *      ↓
-   * 不 refresh
-   *
-   * generation 2 Ready
-   *      ↓
-   * refresh()
-   */
-  const lastReadyGeneration =
-    useRef<number | null>(null);
-
   const [
     loading,
     setLoading,
@@ -333,27 +711,62 @@ function App() {
     setReconnectingManually,
   ] = useState(false);
 
+  const retryCountdownMs = connection?.retryInMs ?? null;
+
   const [
-    retryCountdownMs,
-    setRetryCountdownMs,
-  ] = useState<number | null>(null);
+    settings,
+    setSettings,
+  ] = useState<MonitorSettings | null>(null);
+
+  const [
+    analyticsReloadToken,
+    setAnalyticsReloadToken,
+  ] = useState(0);
+
+  const [schedulerStatus, setSchedulerStatus] =
+    useState<UsageSchedulerStatus | null>(null);
+
+  const [
+    settingsOpen,
+    setSettingsOpen,
+  ] = useState(false);
+
+  const [
+    settingsSaving,
+    setSettingsSaving,
+  ] = useState(false);
+
+  useEffect(() => {
+    void invoke<MonitorSettings>("get_monitor_settings").then((loadedSettings) => {
+      setSettings(loadedSettings);
+    }).catch((loadError) => {
+      console.error("[UI] failed to load monitor data:", loadError);
+    });
+  }, []);
+
+  const saveSettings = useCallback(async (next: MonitorSettings) => {
+    setSettings(next);
+    setSettingsSaving(true);
+    try {
+      const saved = await invoke<MonitorSettings>("save_monitor_settings", {
+        settings: next,
+      });
+      setSettings(saved);
+    } catch (saveError) {
+      console.error("[UI] failed to save monitor settings:", saveError);
+      setError(String(saveError));
+    } finally {
+      setSettingsSaving(false);
+    }
+  }, []);
 
   /*
    * ==========================================================
    * Snapshot Refresh
    * ==========================================================
    *
-   * 注意：
-   *
-   * 现在这个 invoke 已经不会 spawn 新 app-server。
-   *
-   * React
-   *    ↓
-   * get_codex_snapshot
-   *    ↓
-   * Singleton CodexRpcClient
-   *    ↓
-   * 同一个 app-server
+   * React 只触发一次显式刷新请求；真正的 RPC 与数据事件由 Rust
+   * UsageRefreshScheduler 执行。
    */
   const refresh =
     useCallback(
@@ -362,14 +775,7 @@ function App() {
           setLoading(true);
           setError(null);
 
-          const data =
-            await invoke<
-              CodexSnapshot
-            >(
-              "get_codex_snapshot",
-            );
-
-          setSnapshot(data);
+          await invoke<void>("refresh_usage_now");
         } catch (error) {
           console.error(
             "[UI] snapshot refresh failed:",
@@ -448,48 +854,6 @@ function App() {
       (() => void)
       | undefined;
 
-    /*
-     * 每个 generation
-     * 只触发一次 snapshot refresh。
-     */
-    const refreshWhenReady = (
-      status:
-        CodexConnectionStatus,
-    ) => {
-      if (
-        status.phase !== "ready"
-      ) {
-        return;
-      }
-
-      if (
-        lastReadyGeneration.current
-        === status.generation
-      ) {
-        return;
-      }
-
-      console.log(
-        "[UI] Codex ready, generation:",
-        status.generation,
-      );
-
-      lastReadyGeneration.current =
-        status.generation;
-
-      /*
-       * 新连接 Ready 后重新读取：
-       *
-       * Account
-       * Rate Limits
-       * Usage
-       *
-       * 这样即使断线期间数据变化，
-       * 恢复连接后也会自动同步。
-       */
-      void refresh();
-    };
-
     const setupConnectionListener =
       async () => {
         /*
@@ -517,9 +881,6 @@ function App() {
                 event.payload,
               );
 
-              refreshWhenReady(
-                event.payload,
-              );
             },
           );
 
@@ -557,9 +918,14 @@ function App() {
             status,
           );
 
-          refreshWhenReady(
-            status,
+          const cached = await invoke<CodexSnapshot | null>(
+            "get_cached_codex_snapshot",
           );
+          if (cached && !disposed) {
+            setSnapshot(cached);
+            setAnalyticsReloadToken((value) => value + 1);
+            setLoading(false);
+          }
         } catch (error) {
           console.error(
             "[UI] failed to read connection status:",
@@ -577,7 +943,7 @@ function App() {
         unlisten();
       }
     };
-  }, [refresh]);
+  }, []);
 
   useEffect(() => {
     if (
@@ -591,105 +957,62 @@ function App() {
   }, [connection?.phase]);
 
   useEffect(() => {
-    if (
-      connection?.phase
-        !== "reconnecting"
-      || connection.retryInMs
-        === null
-      || connection.retryInMs
-        <= 0
-    ) {
-      setRetryCountdownMs(null);
-      return;
-    }
+    let disposed = false;
+    let unlistenSnapshot: (() => void) | undefined;
+    let unlistenScheduler: (() => void) | undefined;
 
-    const initialMs =
-      connection.retryInMs;
-
-    const startedAt =
-      Date.now();
-
-    const update = () => {
-      setRetryCountdownMs(
-        Math.max(
-          0,
-          initialMs
-            - (Date.now() - startedAt),
-        ),
-      );
-    };
-
-    update();
-
-    const timer =
-      window.setInterval(
-        update,
-        250,
-      );
-
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [
-    connection?.phase,
-    connection?.retryInMs,
-    connection?.attempt,
-  ]);
-
-  /*
-   * ==========================================================
-   * Token Usage Polling
-   * ==========================================================
-   *
-   * 注意：
-   *
-   * 这里已经不再：
-   *
-   * useEffect(() => {
-   *   void refresh();
-   * }, [])
-   *
-   * 初次 refresh 由：
-   *
-   * connection → ready
-   *
-   * 自动触发。
-   *
-   *
-   * Ready：
-   *
-   * 每 5 分钟刷新一次 Token Usage。
-   *
-   * Disconnected / Reconnecting：
-   *
-   * 不做 RPC polling。
-   */
-  useEffect(() => {
-    if (
-      connection?.phase
-      !== "ready"
-    ) {
-      return;
-    }
-
-    const timer =
-      window.setInterval(
-        () => {
-          void refresh();
+    const setup = async () => {
+      unlistenSnapshot = await listen<CodexSnapshot>(
+        "codex://usage-snapshot",
+        (event) => {
+          if (disposed) {
+            return;
+          }
+          setSnapshot(event.payload);
+          setAnalyticsReloadToken((value) => value + 1);
+          setLoading(false);
+          setError(null);
         },
-
-        5 * 60 * 1000,
       );
+
+      unlistenScheduler = await listen<UsageSchedulerStatus>(
+        "codex://usage-refresh-state",
+        (event) => {
+          if (!disposed) {
+            setSchedulerStatus(event.payload);
+          }
+        },
+      );
+
+      const cached = await invoke<CodexSnapshot | null>(
+        "get_cached_codex_snapshot",
+      );
+      if (cached && !disposed) {
+        setSnapshot(cached);
+        setAnalyticsReloadToken((value) => value + 1);
+        setLoading(false);
+      }
+
+      const currentSchedulerStatus = await invoke<UsageSchedulerStatus>(
+        "get_usage_scheduler_status",
+      );
+      if (!disposed) {
+        setSchedulerStatus(currentSchedulerStatus);
+      }
+    };
+
+    void setup().catch((setupError) => {
+      if (!disposed) {
+        console.error("[UI] usage event setup failed:", setupError);
+      }
+    });
 
     return () => {
-      window.clearInterval(
-        timer,
-      );
+      disposed = true;
+      unlistenSnapshot?.();
+      unlistenScheduler?.();
     };
-  }, [
-    refresh,
-    connection?.phase,
-  ]);
+  }, []);
 
   /*
    * ==========================================================
@@ -856,6 +1179,13 @@ function App() {
       ],
     );
 
+  const weeklyQuotaWindows = quotaWindows.filter(
+    (quota) => quota.windowDurationMins === 10080,
+  );
+  const nonWeeklyQuotaWindows = quotaWindows.filter(
+    (quota) => quota.windowDurationMins !== 10080,
+  );
+
   /*
    * ==========================================================
    * Usage
@@ -876,44 +1206,6 @@ function App() {
         usage
           ?.dailyUsageBuckets,
       ],
-    );
-
-  /*
-   * 真正的最近 7 个自然日。
-   *
-   * API 没有 bucket 的日期：
-   *
-   * tokens = 0
-   */
-  const buckets =
-    useMemo(
-      () =>
-        buildLastDays(
-          usage
-            ?.dailyUsageBuckets,
-
-          7,
-        ),
-
-      [
-        usage
-          ?.dailyUsageBuckets,
-      ],
-    );
-
-  const maxTokens =
-    useMemo(
-      () =>
-        Math.max(
-          1,
-
-          ...buckets.map(
-            (item) =>
-              item.tokens,
-          ),
-        ),
-
-      [buckets],
     );
 
   /*
@@ -973,52 +1265,6 @@ function App() {
 
   const connectionReady =
     connection?.phase === "ready";
-
-  /*
-   * Codex emits account/updated when authentication or the active
-   * account changes. Re-read the snapshot immediately instead of
-   * waiting for the five-minute usage poll.
-   */
-  useEffect(() => {
-    let disposed = false;
-
-    let unlisten:
-      (() => void)
-      | undefined;
-
-    const setup =
-      async () => {
-        unlisten = await listen<
-          AccountUpdatedPayload
-        >(
-          "codex://account-updated",
-          (event) => {
-            if (disposed) {
-              return;
-            }
-
-            console.log(
-              "[UI] received account update:",
-              event.payload,
-            );
-
-            if (connectionReady) {
-              void refresh();
-            }
-          },
-        );
-      };
-
-    void setup();
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [
-    connectionReady,
-    refresh,
-  ]);
 
   const accountState:
     CodexAccountState =
@@ -1145,29 +1391,32 @@ function App() {
           </div>
         </div>
 
-        <button
-          className="refresh"
-
-          onClick={
-            () =>
-              void refresh()
-          }
-
-          /*
-           * 连接没 Ready 时不能 Refresh。
-           */
-          disabled={
-            loading
-            || !connectionReady
-          }
-        >
-          {
-            loading
-              ? "加载中…"
-              : "刷新"
-          }
-        </button>
+        <div className="topbar-actions">
+          <button
+            className="secondary-button"
+            onClick={() => setSettingsOpen((open) => !open)}
+          >
+            {settingsOpen ? "收起设置" : "设置"}
+          </button>
+          <button
+            className="refresh"
+            onClick={() => void refresh()}
+            /* 连接没 Ready 时不能 Refresh。 */
+            disabled={loading || !connectionReady}
+          >
+            {loading ? "加载中…" : "刷新"}
+          </button>
+        </div>
       </header>
+
+      {settingsOpen && settings ? (
+        <SettingsPanel
+          settings={settings}
+          saving={settingsSaving}
+          schedulerStatus={schedulerStatus}
+          onChange={(next) => void saveSettings(next)}
+        />
+      ) : null}
 
       {/*
        * ======================================================
@@ -1337,57 +1586,62 @@ function App() {
                * ==============================================
                */}
 
+              {nonWeeklyQuotaWindows.length > 0 ? (
+                <div className="quota-grid">
+                  {nonWeeklyQuotaWindows.map((quota) => (
+                    <QuotaCard
+                      key={quota.id}
+                      limitName={quota.limitName}
+                      title={quota.label}
+                      usedPercent={quota.usedPercent}
+                      remainingPercent={quota.remainingPercent}
+                      resetsAt={quota.resetsAt}
+                    />
+                  ))}
+                </div>
+              ) : null}
+
+              {weeklyQuotaWindows.length > 0 ? (
+                <div className="quota-grid weekly-quota-row">
+                  {weeklyQuotaWindows.map((quota) => (
+                    <QuotaCard
+                      key={quota.id}
+                      limitName={quota.limitName}
+                      title={quota.label}
+                      usedPercent={quota.usedPercent}
+                      remainingPercent={quota.remainingPercent}
+                      resetsAt={quota.resetsAt}
+                    />
+                  ))}
+                  <DailyModelUsageCard reloadToken={analyticsReloadToken} />
+                </div>
+              ) : (
+                !loading && (
+                  <section className="error-card">
+                    <strong>未返回速率限制数据。</strong>
+                  </section>
+                )
+              )}
+
+              <UsageAnalyticsPanel reloadToken={analyticsReloadToken} />
+
               {
-                quotaWindows.length
-                  > 0
+                (snapshot.rateLimits?.rateLimitResetCredits?.availableCount ?? 0) > 0
                   ? (
-                    <div
-                      className="quota-grid"
-                    >
-                      {
-                        quotaWindows.map(
-                          (quota) => (
-                            <QuotaCard
-                              key={
-                                quota.id
-                              }
-
-                              title={
-                                quota.label
-                              }
-
-                              usedPercent={
-                                quota
-                                  .usedPercent
-                              }
-
-                              remainingPercent={
-                                quota
-                                  .remainingPercent
-                              }
-
-                              resetsAt={
-                                quota
-                                  .resetsAt
-                              }
-                            />
-                          ),
-                        )
-                      }
-                    </div>
+                    <section className="credit-card">
+                      <div className="eyebrow">Earned reset credits</div>
+                      <div className="row">
+                        <h2>
+                          {snapshot.rateLimits?.rateLimitResetCredits?.availableCount} reset available
+                        </h2>
+                        <span className="muted small">V2 操作功能</span>
+                      </div>
+                      <p className="muted small">
+                        当前账号有可用的 earned reset；消费动作会在后续版本接入。
+                      </p>
+                    </section>
                   )
-
-                  : (
-                    !loading && (
-                      <section
-                        className="error-card"
-                      >
-                        <strong>
-                          未返回速率限制数据。
-                        </strong>
-                      </section>
-                    )
-                  )
+                  : null
               }
 
               {/*
@@ -1482,115 +1736,6 @@ function App() {
                 </div>
               </section>
 
-              {/*
-               * ==============================================
-               * Token Chart
-               * ==============================================
-               */}
-
-              <section
-                className="chart-card"
-              >
-                <div
-                  className="row"
-                >
-                  <div>
-                    <div
-                      className="eyebrow"
-                    >
-                      活动
-                    </div>
-
-                    <h2>
-                      最近 7 天
-                    </h2>
-                  </div>
-
-                  <div
-                    className="muted tiny"
-                  >
-                    {
-                      connectionReady
-                        ? "配额实时更新 · 用量每 5 分钟更新"
-
-                        : "离线 · 显示最近数据"
-                    }
-                  </div>
-                </div>
-
-                <div
-                  className="chart"
-                >
-                  {
-                    buckets.map(
-                      (item) => {
-                        const height =
-                          item.tokens === 0
-                            ? 0
-
-                            : Math.max(
-                              6,
-
-                              (
-                                item.tokens
-                                / maxTokens
-                              )
-                              * 100,
-                            );
-
-                        return (
-                          <div
-                            className="chart-col"
-
-                            key={
-                              item.startDate
-                            }
-
-                            title={
-                              `${item.startDate
-                              }: ${item.tokens
-                              } token`
-                            }
-                          >
-                            <div
-                              className="chart-value"
-                            >
-                              {
-                                formatNumber(
-                                  item.tokens,
-                                )
-                              }
-                            </div>
-
-                            <div
-                              className="chart-track"
-                            >
-                              <div
-                                className="chart-bar"
-
-                                style={{
-                                  height:
-                                    `${height}%`,
-                                }}
-                              />
-                            </div>
-
-                            <div
-                              className="tiny muted"
-                            >
-                              {
-                                item
-                                  .startDate
-                                  .slice(5)
-                              }
-                            </div>
-                          </div>
-                        );
-                      },
-                    )
-                  }
-                </div>
-              </section>
             </>
           )
 

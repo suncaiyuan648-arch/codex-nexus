@@ -127,3 +127,176 @@ export interface CodexConnectionStatus {
 
   codexPath: string | null;
 }
+
+export interface MonitorSettings {
+  notifyThresholds: number[];
+  notifyQuotaReset: boolean;
+  launchAtStartup: boolean;
+  startMinimized: boolean;
+  closeToTray: boolean;
+  usageRefreshPolicy: string;
+  lastNotifiedThreshold: Record<string, number>;
+  lastSeenResetAt: Record<string, number>;
+  lastResetNotifiedAt: Record<string, number>;
+}
+
+export interface UsageSchedulerStatus {
+  policy: string;
+  mode: string;
+  watcherActive: boolean;
+  pendingReconciliation: boolean;
+  fallbackSeconds: number;
+  lastRefreshAt: number | null;
+  lastLocalActivityAt: number | null;
+}
+
+export interface DailyModelUsageCategory {
+  model: string;
+  reasoningEffort: string;
+  speedMode: "standard" | "fast_requested" | "unknown";
+  rawTokens: number;
+  turnCount: number;
+}
+
+export interface DailyModelUsage {
+  date: string;
+  accountKey: string | null;
+  officialTokens: number | null;
+  categories: DailyModelUsageCategory[];
+  modelQuotaAttribution: "unavailable";
+}
+
+export interface HistoryLimit {
+  limitId: string;
+  limitName: string;
+  window: string;
+  windowDurationMins: number;
+  usedPercent: number;
+  resetsAt: number | null;
+}
+
+export interface UsageHistoryEntry {
+  timestamp: number;
+  limits: Record<string, HistoryLimit>;
+  lifetimeTokens: number | null;
+}
+
+export type UsageRange = "7d" | "15d" | "30d" | "90d" | "all";
+export type UsageBreakdown = "model" | "reasoning" | "speed" | "tokenType";
+
+export type UsageSource = "official" | "local" | "derived" | "estimated";
+export type UsageConfidence = "high" | "medium" | "low" | "unknown";
+
+export type UsageAccountScope =
+  | { type: "single"; accountKey: string }
+  | { type: "all" };
+
+export interface UsageAnalyticsQuery {
+  accountScope: UsageAccountScope;
+  from: string;
+  to: string;
+  timezone: string;
+  breakdown: "model" | "reasoning" | "speed" | "account" | "tokenType";
+}
+
+export type UsageReasoningEffort = "low" | "medium" | "high" | "xhigh" | "ultra" | "unknown";
+export type UsageSpeedMode = "standard" | "fast_requested" | "unknown";
+
+export interface TurnUsageRecord {
+  accountKey: string;
+  threadId: string;
+  turnId: string;
+  startedAt: number;
+  completedAt: number | null;
+  model: string | null;
+  reasoningEffort: UsageReasoningEffort;
+  speedMode: UsageSpeedMode;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  rawTotalTokens: number;
+  estimatedCredits: number | null;
+  source: "rollout" | "app-server";
+  confidence: Exclude<UsageConfidence, "unknown">;
+}
+
+export interface UsageBreakdownItem {
+  key: string;
+  label: string;
+  rawTokens: number;
+  rawTokenShare: number;
+  estimatedCredits: number | null;
+  attributedQuotaPercent: number | null;
+  quotaShare: number | null;
+  source: UsageSource;
+  confidence: UsageConfidence;
+}
+
+export interface DailyUsageAnalytics {
+  date: string;
+  localTokens: number;
+  rawTokens: number;
+  officialTokens: number | null;
+  estimatedCredits: number | null;
+  observedQuotaPercent: number | null;
+  attributableQuotaPercent: number | null;
+  unattributedQuotaPercent: number | null;
+  turnCount: number;
+  categories: Record<string, {
+    rawTokens: number;
+    estimatedCredits: number | null;
+    attributedQuotaPercent: number | null;
+    source: UsageSource;
+    confidence: UsageConfidence;
+  }>;
+}
+
+export interface UsageAnalyticsV1 {
+  scope: UsageAccountScope;
+  period: { from: string; to: string; timezone: string };
+  summary: {
+    rawTokens: number;
+    estimatedCredits: number | null;
+    observedQuotaPercent: number | null;
+    attributableQuotaPercent: number | null;
+    unattributedQuotaPercent: number | null;
+    activeDays: number;
+    turnCount: number;
+  };
+  breakdownItems: UsageBreakdownItem[];
+  timeline: DailyUsageAnalytics[];
+  accounts: Array<{
+    accountKey: string;
+    displayName: string | null;
+    rawTokens: number;
+    estimatedCredits: number | null;
+    observedQuotaPercent: number | null;
+    currentUsedPercent: number | null;
+    remainingPercent: number | null;
+    resetsAt: number | null;
+    activeDays: number;
+    turnCount: number;
+  }>;
+}
+
+export interface UsageAnalyticsPoint {
+  date: string;
+  officialTokens: number | null;
+  localTokens: number;
+  unattributedTokens: number;
+  categoryValues: Record<string, number>;
+}
+
+export interface UsageAnalytics {
+  accountKey: string | null;
+  range: UsageRange;
+  breakdown: UsageBreakdown;
+  categories: string[];
+  points: UsageAnalyticsPoint[];
+  turnCount: number;
+  officialTotalTokens: number;
+  localTotalTokens: number;
+  estimatedRemainingTokens: number | null;
+  estimateSampleCount: number;
+}

@@ -1,60 +1,37 @@
 mod codex;
+mod monitor;
+mod usage;
 
-use chrono::{
-    Datelike,
-    Local,
-    TimeZone,
-    Timelike,
-};
+use chrono::{Datelike, Local, TimeZone, Timelike};
 
-use codex::{
-    CodexRpcClient,
-    ConnectionStatus,
-};
+use codex::{CodexRpcClient, ConnectionStatus};
+
+use monitor::MonitorSettings;
 
 use serde_json::{json, Value};
 
 use std::{
     sync::Arc,
     thread,
-    time::{
-        SystemTime,
-        UNIX_EPOCH,
-    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use tauri::{
     image::Image,
-    menu::{
-        Menu,
-        MenuItem,
-        PredefinedMenuItem,
-    },
-    tray::{
-        MouseButton,
-        MouseButtonState,
-        TrayIcon,
-        TrayIconBuilder,
-        TrayIconEvent,
-    },
-    Manager,
-    Listener,
-    State,
-    WindowEvent,
-    Wry,
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Listener, Manager, State, WindowEvent, Wry,
 };
+use tauri_plugin_autostart::ManagerExt as AutoStartManagerExt;
 
 #[cfg(target_os = "macos")]
-const TRAY_ICON_BYTES: &[u8] =
-    include_bytes!("../icons/tray/macos/tray@2x.png");
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray/macos/tray@2x.png");
 
 #[cfg(target_os = "windows")]
-const TRAY_ICON_BYTES: &[u8] =
-    include_bytes!("../icons/tray/windows/tray.ico");
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray/windows/tray.ico");
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const TRAY_ICON_BYTES: &[u8] =
-    include_bytes!("../icons/tray/macos/tray@2x.png");
+const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray/macos/tray@2x.png");
 
 const TRAY_ICON_IS_TEMPLATE: bool = cfg!(target_os = "macos");
 
@@ -81,38 +58,125 @@ struct TrayQuotaSummary {
 }
 
 #[tauri::command]
-fn get_codex_connection_status(
-    state: State<'_, CodexState>,
-) -> ConnectionStatus {
+fn get_codex_connection_status(state: State<'_, CodexState>) -> ConnectionStatus {
     state.client.status()
 }
 
 #[tauri::command]
-fn reconnect_codex(
-    state: State<'_, CodexState>,
-) -> Result<(), String> {
+fn reconnect_codex(state: State<'_, CodexState>) -> Result<(), String> {
     state.client.reconnect()
 }
 
 #[tauri::command]
-fn get_codex_snapshot(
-    state: State<'_, CodexState>,
-) -> Result<Value, String> {
-    fetch_codex_snapshot(&state.client)
+fn get_codex_snapshot(app: AppHandle<Wry>, state: State<'_, CodexState>) -> Result<Value, String> {
+    let snapshot = fetch_codex_snapshot(&state.client)?;
+    if let Err(error) = usage::record_official_snapshot(&app, &snapshot) {
+        eprintln!("[Usage] failed to record official snapshot: {}", error);
+    }
+    monitor::process_snapshot(&app, &snapshot);
+    let _ = app.emit("codex://usage-snapshot", snapshot.clone());
+    Ok(snapshot)
 }
 
-fn fetch_codex_snapshot(
-    client: &Arc<CodexRpcClient>,
-) -> Result<Value, String> {
+#[tauri::command]
+fn get_monitor_settings(app: AppHandle<Wry>) -> Result<MonitorSettings, String> {
+    monitor::load_settings(&app)
+}
 
+#[tauri::command]
+fn save_monitor_settings(
+    app: AppHandle<Wry>,
+    scheduler: State<'_, usage::UsageSchedulerState>,
+    settings: MonitorSettings,
+) -> Result<MonitorSettings, String> {
+    let saved = monitor::save_settings(&app, settings)?;
+
+    if saved.launch_at_startup {
+        app.autolaunch()
+            .enable()
+            .map_err(|error| error.to_string())?;
+    } else {
+        app.autolaunch()
+            .disable()
+            .map_err(|error| error.to_string())?;
+    }
+
+    scheduler
+        .scheduler
+        .set_policy(saved.usage_refresh_policy.clone());
+
+    Ok(saved)
+}
+
+#[tauri::command]
+fn get_usage_scheduler_status(
+    state: State<'_, usage::UsageSchedulerState>,
+) -> usage::UsageSchedulerStatus {
+    state.scheduler.status()
+}
+
+#[tauri::command]
+fn get_cached_codex_snapshot(state: State<'_, usage::UsageSchedulerState>) -> Option<Value> {
+    state.scheduler.cached_snapshot()
+}
+
+#[tauri::command]
+fn refresh_usage_now(state: State<'_, usage::UsageSchedulerState>) -> Result<(), String> {
+    state.scheduler.refresh_now_blocking()
+}
+
+#[tauri::command]
+fn get_usage_history(app: AppHandle<Wry>) -> Result<Vec<monitor::UsageHistoryEntry>, String> {
+    monitor::load_history(&app)
+}
+
+#[tauri::command]
+fn get_usage_analytics(
+    app: AppHandle<Wry>,
+    range: Option<String>,
+    breakdown: Option<String>,
+    account_scope: Option<usage::AccountScope>,
+    from: Option<String>,
+    to: Option<String>,
+    timezone: Option<String>,
+) -> Result<usage::UsageAnalytics, String> {
+    if let (Some(account_scope), Some(from), Some(to)) = (account_scope, from, to) {
+        return usage::analytics::app_query(
+            &app,
+            &usage::UsageAnalyticsQuery {
+                account_scope,
+                from,
+                to,
+                timezone: timezone.unwrap_or_else(|| "local".into()),
+                breakdown: breakdown.unwrap_or_else(|| "model".into()),
+            },
+        );
+    }
+    usage::analytics(
+        &app,
+        range.as_deref().unwrap_or("30d"),
+        breakdown.as_deref().unwrap_or("model"),
+    )
+}
+
+#[tauri::command]
+fn get_usage_analytics_v1(
+    app: AppHandle<Wry>,
+    query: usage::UsageAnalyticsQuery,
+) -> Result<usage::UsageAnalytics, String> {
+    usage::analytics::app_query(&app, &query)
+}
+
+#[tauri::command]
+fn get_daily_model_usage(app: AppHandle<Wry>) -> Result<usage::DailyModelUsage, String> {
+    usage::analytics::app_daily_model_usage(&app)
+}
+
+pub(crate) fn fetch_codex_snapshot(client: &Arc<CodexRpcClient>) -> Result<Value, String> {
     // These RPCs are independent, so send all three before waiting for any
     // response. The client's request IDs and pending map route responses back
     // to the matching worker.
-    let (
-        account_result,
-        rate_limits_result,
-        usage_result,
-    ) = thread::scope(|scope| {
+    let (account_result, rate_limits_result, usage_result) = thread::scope(|scope| {
         let account = scope.spawn(|| {
             client.request(
                 "account/read",
@@ -122,19 +186,9 @@ fn fetch_codex_snapshot(
             )
         });
 
-        let rate_limits = scope.spawn(|| {
-            client.request(
-                "account/rateLimits/read",
-                None,
-            )
-        });
+        let rate_limits = scope.spawn(|| client.request("account/rateLimits/read", None));
 
-        let usage = scope.spawn(|| {
-            client.request(
-                "account/usage/read",
-                None,
-            )
-        });
+        let usage = scope.spawn(|| client.request("account/usage/read", None));
 
         let account_result = account
             .join()
@@ -148,20 +202,10 @@ fn fetch_codex_snapshot(
             .join()
             .map_err(|_| "Usage RPC worker panicked".to_string())?;
 
-        Ok::<_, String>(
-            (
-                account_result,
-                rate_limits_result,
-                usage_result,
-            )
-        )
+        Ok::<_, String>((account_result, rate_limits_result, usage_result))
     })?;
 
-    let (
-        account,
-        account_error,
-        account_state,
-    ) = match account_result {
+    let (account, account_error, account_state) = match account_result {
         Ok(value) => {
             let signed_in = value
                 .get("account")
@@ -169,49 +213,27 @@ fn fetch_codex_snapshot(
                 .unwrap_or(false);
 
             if signed_in {
-                (
-                    Some(value),
-                    None,
-                    "signedIn",
-                )
+                (Some(value), None, "signedIn")
             } else {
-                (
-                    Some(value),
-                    None,
-                    "signedOut",
-                )
+                (Some(value), None, "signedOut")
             }
         }
 
-        Err(error) => (
-            None,
-            Some(error.clone()),
-            classify_account_error(&error),
-        ),
+        Err(error) => (None, Some(error.clone()), classify_account_error(&error)),
     };
 
     let rate_limits = rate_limits_result?;
 
-    let (
-        usage,
-        usage_error,
-    ) = match usage_result {
-        Ok(value) => (
-            Some(value),
-            None,
-        ),
+    let (usage, usage_error) = match usage_result {
+        Ok(value) => (Some(value), None),
 
-        Err(error) => (
-            None,
-            Some(error),
-        ),
+        Err(error) => (None, Some(error)),
     };
 
-    let fetched_at =
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_millis();
+    let fetched_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
 
     Ok(json!({
         "codexPath":
@@ -241,12 +263,8 @@ fn fetch_codex_snapshot(
     }))
 }
 
-fn tray_quota_summary(
-    snapshot: &Value,
-) -> TrayQuotaSummary {
-    let rate_limits = snapshot
-        .get("rateLimits")
-        .and_then(Value::as_object);
+fn tray_quota_summary(snapshot: &Value) -> TrayQuotaSummary {
+    let rate_limits = snapshot.get("rateLimits").and_then(Value::as_object);
 
     let mut windows = Vec::new();
 
@@ -256,21 +274,13 @@ fn tray_quota_summary(
             .and_then(Value::as_object)
         {
             for bucket in by_id.values() {
-                collect_tray_windows(
-                    bucket,
-                    &mut windows,
-                );
+                collect_tray_windows(bucket, &mut windows);
             }
         }
 
         if windows.is_empty() {
-            if let Some(bucket) = rate_limits
-                .get("rateLimits")
-            {
-                collect_tray_windows(
-                    bucket,
-                    &mut windows,
-                );
+            if let Some(bucket) = rate_limits.get("rateLimits") {
+                collect_tray_windows(bucket, &mut windows);
             }
         }
     }
@@ -292,16 +302,9 @@ fn tray_quota_summary(
             buckets
                 .iter()
                 .find(|bucket| {
-                    bucket
-                        .get("startDate")
-                        .and_then(Value::as_str)
-                        == Some(today.as_str())
+                    bucket.get("startDate").and_then(Value::as_str) == Some(today.as_str())
                 })
-                .and_then(|bucket| {
-                    bucket
-                        .get("tokens")
-                        .and_then(Value::as_f64)
-                })
+                .and_then(|bucket| bucket.get("tokens").and_then(Value::as_f64))
         });
 
     match selected {
@@ -311,8 +314,7 @@ fn tray_quota_summary(
             TrayQuotaSummary {
                 label: tray_window_label(*duration),
                 used_percent,
-                remaining_percent:
-                    (100.0 - used_percent).max(0.0),
+                remaining_percent: (100.0 - used_percent).max(0.0),
                 resets_at: *resets_at,
                 today_tokens,
             }
@@ -328,19 +330,13 @@ fn tray_quota_summary(
     }
 }
 
-fn collect_tray_windows(
-    bucket: &Value,
-    windows: &mut Vec<(u64, f64, Option<i64>)>,
-) {
+fn collect_tray_windows(bucket: &Value, windows: &mut Vec<(u64, f64, Option<i64>)>) {
     for key in ["primary", "secondary"] {
         let Some(window) = bucket.get(key) else {
             continue;
         };
 
-        let Some(duration) = window
-            .get("windowDurationMins")
-            .and_then(Value::as_u64)
-        else {
+        let Some(duration) = window.get("windowDurationMins").and_then(Value::as_u64) else {
             continue;
         };
 
@@ -349,13 +345,11 @@ fn collect_tray_windows(
             .and_then(Value::as_f64)
             .unwrap_or(0.0);
 
-        let resets_at = window
-            .get("resetsAt")
-            .and_then(|value| {
-                value
-                    .as_i64()
-                    .or_else(|| value.as_u64().map(|value| value as i64))
-            });
+        let resets_at = window.get("resetsAt").and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|value| value as i64))
+        });
 
         windows.push((duration, used_percent, resets_at));
     }
@@ -370,12 +364,9 @@ fn tray_window_label(minutes: u64) -> String {
         300 => "5 小时".into(),
         1440 => "每日".into(),
         10080 => "每周".into(),
-        value if value % 10080 == 0 =>
-            format!("{} 周", value / 10080),
-        value if value % 1440 == 0 =>
-            format!("{} 天", value / 1440),
-        value if value % 60 == 0 =>
-            format!("{} 小时", value / 60),
+        value if value % 10080 == 0 => format!("{} 周", value / 10080),
+        value if value % 1440 == 0 => format!("{} 天", value / 1440),
+        value if value % 60 == 0 => format!("{} 小时", value / 60),
         value => format!("{} 分钟", value),
     }
 }
@@ -397,8 +388,7 @@ fn format_tray_tokens(tokens: Option<f64>) -> String {
 }
 
 fn tray_progress_bar(used_percent: f64) -> String {
-    let filled = ((clamp_percent(used_percent) / 100.0) * 20.0)
-        .round() as usize;
+    let filled = ((clamp_percent(used_percent) / 100.0) * 20.0).round() as usize;
 
     format!(
         "{}{} {:.0}%",
@@ -454,57 +444,24 @@ fn format_tray_reset_absolute(resets_at: Option<i64>) -> String {
         .unwrap_or_else(|| "重置时间不可用".into())
 }
 
-fn update_tray_display(
-    client: &Arc<CodexRpcClient>,
-    display: &TrayDisplay,
-) {
-    let snapshot = match fetch_codex_snapshot(client) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let connected = client.status().phase == "ready";
-            let _ = display.status.set_text(
-                if connected {
-                    "Codex 已连接 · 额度不可用"
-                } else {
-                    "Codex 未连接"
-                },
-            );
-            let _ = display.weekly_progress.set_text("等待连接…");
-            let _ = display.weekly_reset.set_text("重置时间不可用");
-            let _ = display.today.set_text("今日 · 暂无数据");
-            let _ = display.tray.set_tooltip(Some(format!(
-                "Codex 用量\n{}\n{}",
-                if connected { "额度暂不可用" } else { "未连接" },
-                error,
-            )));
-            let _ = display.tray.set_title(Some(
-                if connected { "Codex —" } else { "Codex" },
-            ));
-            return;
-        }
-    };
-
+fn apply_tray_snapshot(snapshot: &Value, display: &TrayDisplay) {
     let summary = tray_quota_summary(&snapshot);
     let used = summary.used_percent.round();
     let remaining = summary.remaining_percent.round();
     let reset_relative = format_tray_reset_relative(summary.resets_at);
     let reset_absolute = format_tray_reset_absolute(summary.resets_at);
-    let account_available = snapshot
-        .get("accountState")
-        .and_then(Value::as_str)
-        == Some("signedIn");
+    let account_available =
+        snapshot.get("accountState").and_then(Value::as_str) == Some("signedIn");
 
-    let _ = display.status.set_text(
-        if account_available {
-            "Codex 已连接"
-        } else {
-            "Codex 已连接 · 账号不可用"
-        },
-    );
+    let _ = display.status.set_text(if account_available {
+        "Codex 已连接"
+    } else {
+        "Codex 已连接 · 账号不可用"
+    });
     let _ = display.weekly_title.set_text(&summary.label);
-    let _ = display.weekly_progress.set_text(tray_progress_bar(
-        summary.used_percent,
-    ));
+    let _ = display
+        .weekly_progress
+        .set_text(tray_progress_bar(summary.used_percent));
     let _ = display.weekly_reset.set_text(reset_absolute);
     let _ = display.today.set_text(format!(
         "今日 · {}",
@@ -514,10 +471,7 @@ fn update_tray_display(
     let tooltip = if account_available {
         format!(
             "Codex 用量\n{} {}%\n剩余 {}%\n{}",
-            summary.label,
-            used,
-            remaining,
-            reset_relative,
+            summary.label, used, remaining, reset_relative,
         )
     } else {
         "Codex 用量\n账号不可用\n请登录 Codex".into()
@@ -534,105 +488,51 @@ fn update_tray_display(
     )));
 }
 
-fn update_tray_connection_state(
-    display: &TrayDisplay,
-    phase: &str,
-) {
+fn update_tray_connection_state(display: &TrayDisplay, phase: &str) {
     let (status, message) = match phase {
-        "connecting" | "initializing" =>
-            ("Codex 正在连接…", "正在连接 Codex…"),
-        "reconnecting" =>
-            ("Codex 重连中…", "正在重新连接 Codex…"),
-        "disconnected" =>
-            ("Codex 未连接", "Codex 连接已断开"),
+        "connecting" | "initializing" => ("Codex 正在连接…", "正在连接 Codex…"),
+        "reconnecting" => ("Codex 重连中…", "正在重新连接 Codex…"),
+        "disconnected" => ("Codex 未连接", "Codex 连接已断开"),
         _ => return,
     };
 
     let _ = display.status.set_text(status);
     let _ = display.weekly_progress.set_text(message);
-    let _ = display.tray.set_tooltip(Some(format!(
-        "Codex 用量\n{}",
-        message,
-    )));
+    let _ = display
+        .tray
+        .set_tooltip(Some(format!("Codex 用量\n{}", message,)));
     let _ = display.tray.set_title(Some("Codex"));
 }
 
-fn spawn_tray_refresh(
-    client: Arc<CodexRpcClient>,
-    display: Arc<TrayDisplay>,
-) {
-    thread::spawn(move || {
-        update_tray_display(&client, &display);
-    });
-}
-
-fn start_tray_updater(
-    app: &tauri::App<Wry>,
-    client: Arc<CodexRpcClient>,
-    display: Arc<TrayDisplay>,
-) {
-    let periodic_client = Arc::clone(&client);
-    let periodic_display = Arc::clone(&display);
-
-    thread::spawn(move || loop {
-        update_tray_display(
-            &periodic_client,
-            &periodic_display,
-        );
-        thread::sleep(std::time::Duration::from_secs(5 * 60));
+fn start_tray_updater(app: &tauri::App<Wry>, display: Arc<TrayDisplay>) {
+    let event_display = Arc::clone(&display);
+    app.listen_any("codex://usage-snapshot", move |event| {
+        if let Ok(snapshot) = serde_json::from_str::<Value>(event.payload()) {
+            apply_tray_snapshot(&snapshot, &event_display);
+        }
     });
 
-    let event_client = Arc::clone(&client);
-    let event_display = Arc::clone(&display);
-    app.listen_any(
-        "codex://rate-limits-updated",
-        move |_| {
-            spawn_tray_refresh(
-                Arc::clone(&event_client),
-                Arc::clone(&event_display),
-            );
-        },
-    );
+    if let Some(snapshot) = app
+        .state::<usage::UsageSchedulerState>()
+        .scheduler
+        .cached_snapshot()
+    {
+        apply_tray_snapshot(&snapshot, &display);
+    }
 
-    let event_client = Arc::clone(&client);
     let event_display = Arc::clone(&display);
-    app.listen_any(
-        "codex://account-updated",
-        move |_| {
-            spawn_tray_refresh(
-                Arc::clone(&event_client),
-                Arc::clone(&event_display),
-            );
-        },
-    );
-
-    let event_client = Arc::clone(&client);
-    let event_display = Arc::clone(&display);
-    app.listen_any(
-        "codex://connection-state",
-        move |event| {
-            let phase = serde_json::from_str::<Value>(
-                event.payload(),
-            )
+    app.listen_any("codex://connection-state", move |event| {
+        let phase = serde_json::from_str::<Value>(event.payload())
             .ok()
             .and_then(|payload| payload.get("phase").cloned())
             .and_then(|phase| phase.as_str().map(str::to_owned));
 
-            if let Some(phase) = phase {
-                if phase == "ready" {
-                    spawn_tray_refresh(
-                        Arc::clone(&event_client),
-                        Arc::clone(&event_display),
-                    );
-                } else {
-                    update_tray_connection_state(
-                        &event_display,
-                        &phase,
-                    );
-                }
+        if let Some(phase) = phase {
+            if phase != "ready" {
+                update_tray_connection_state(&event_display, &phase);
             }
-        },
-    );
+        }
+    });
 }
 
 fn classify_account_error(error: &str) -> &'static str {
@@ -654,190 +554,128 @@ fn classify_account_error(error: &str) -> &'static str {
     }
 }
 
-#[cfg_attr(
-    mobile,
-    tauri::mobile_entry_point
-)]
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("Codex Usage Monitor")
+                .build(),
+        )
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                // Closing the dashboard enters background mode. The tray icon
-                // remains alive so Codex monitoring and quota refresh continue.
-                api.prevent_close();
-                let _ = window.hide();
+                let close_to_tray = monitor::load_settings(window.app_handle())
+                    .map(|settings| settings.close_to_tray)
+                    .unwrap_or(true);
+
+                if close_to_tray {
+                    // Closing the dashboard enters background mode. The tray
+                    // icon remains alive so monitoring continues.
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .setup(|app| {
-            let client =
-                CodexRpcClient::start(
-                    app.handle().clone(),
-                );
+            let client = CodexRpcClient::start(app.handle().clone());
 
-            app.manage(
-                CodexState {
-                    client: Arc::clone(&client),
+            app.manage(CodexState {
+                client: Arc::clone(&client),
+            });
+
+            if let Ok(settings) = monitor::load_settings(app.handle()) {
+                if settings.launch_at_startup {
+                    if let Err(error) = app.autolaunch().enable() {
+                        eprintln!("[Monitor] unable to enable startup launch: {}", error);
+                    }
                 }
-            );
 
-            let status =
-                MenuItem::with_id(
-                    app,
-                    "status",
-                    "Codex 正在连接…",
-                    false,
-                    None::<&str>,
-                )?;
+                if settings.start_minimized {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                }
+            }
 
-            let weekly_title =
-                MenuItem::with_id(
-                    app,
-                    "weekly-title",
-                    "每周",
-                    false,
-                    None::<&str>,
-                )?;
+            let usage_scheduler =
+                usage::UsageRefreshScheduler::start(app.handle().clone(), Arc::clone(&client));
+            app.manage(usage::UsageSchedulerState {
+                scheduler: usage_scheduler,
+            });
+
+            let status = MenuItem::with_id(app, "status", "Codex 正在连接…", false, None::<&str>)?;
+
+            let weekly_title = MenuItem::with_id(app, "weekly-title", "每周", false, None::<&str>)?;
 
             let weekly_progress =
-                MenuItem::with_id(
-                    app,
-                    "weekly-progress",
-                    "等待数据…",
-                    false,
-                    None::<&str>,
-                )?;
+                MenuItem::with_id(app, "weekly-progress", "等待数据…", false, None::<&str>)?;
 
             let weekly_reset =
-                MenuItem::with_id(
-                    app,
-                    "weekly-reset",
-                    "重置时间不可用",
-                    false,
-                    None::<&str>,
-                )?;
+                MenuItem::with_id(app, "weekly-reset", "重置时间不可用", false, None::<&str>)?;
 
-            let today =
-                MenuItem::with_id(
-                    app,
-                    "today",
-                    "今日 · 暂无数据",
-                    false,
-                    None::<&str>,
-                )?;
+            let today = MenuItem::with_id(app, "today", "今日 · 暂无数据", false, None::<&str>)?;
 
-            let show =
-                MenuItem::with_id(
-                    app,
-                    "show",
-                    "打开监控面板",
-                    true,
-                    None::<&str>,
-                )?;
+            let show = MenuItem::with_id(app, "show", "打开监控面板", true, None::<&str>)?;
 
-            let quit =
-                MenuItem::with_id(
-                    app,
-                    "quit",
-                    "退出",
-                    true,
-                    None::<&str>,
-                )?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
 
-            let separator =
-                PredefinedMenuItem::separator(app)?;
+            let separator = PredefinedMenuItem::separator(app)?;
 
-            let menu =
-                Menu::with_items(
-                    app,
-                    &[
-                        &status,
-                        &weekly_title,
-                        &weekly_progress,
-                        &weekly_reset,
-                        &today,
-                        &separator,
-                        &show,
-                        &quit,
-                    ],
-                )?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &status,
+                    &weekly_title,
+                    &weekly_progress,
+                    &weekly_reset,
+                    &today,
+                    &separator,
+                    &show,
+                    &quit,
+                ],
+            )?;
 
-            let mut builder =
-                TrayIconBuilder::with_id("codex-usage")
+            let mut builder = TrayIconBuilder::with_id("codex-usage")
+                .tooltip("Codex 用量\n等待数据…")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
 
-                    .tooltip(
-                        "Codex 用量\n等待数据…"
-                    )
+                            let _ = window.unminimize();
 
-                    .menu(
-                        &menu
-                    )
+                            let _ = window.set_focus();
+                        }
+                    }
 
-                    .show_menu_on_left_click(
-                        false
-                    )
+                    "quit" => {
+                        app.exit(0);
+                    }
 
-                    .on_menu_event(
-                        |app, event| {
-                            match event.id.as_ref() {
-                                "show" => {
-                                    if let Some(window) =
-                                        app.get_webview_window(
-                                            "main"
-                                        )
-                                    {
-                                        let _ =
-                                            window.show();
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
 
-                                        let _ =
-                                            window.unminimize();
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
 
-                                        let _ =
-                                            window.set_focus();
-                                    }
-                                }
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
 
-                                "quit" => {
-                                    app.exit(0);
-                                }
+                            let _ = window.unminimize();
 
-                                _ => {}
-                            }
-                        },
-                    )
-
-                    .on_tray_icon_event(
-                        |tray, event| {
-                            if let
-                                TrayIconEvent::Click {
-                                    button:
-                                        MouseButton::Left,
-
-                                    button_state:
-                                        MouseButtonState::Up,
-
-                                    ..
-                                } = event
-                            {
-                                let app =
-                                    tray.app_handle();
-
-                                if let Some(window) =
-                                    app.get_webview_window(
-                                        "main"
-                                    )
-                                {
-                                    let _ =
-                                        window.show();
-
-                                    let _ =
-                                        window.unminimize();
-
-                                    let _ =
-                                        window.set_focus();
-                                }
-                            }
-                        },
-                    );
+                            let _ = window.set_focus();
+                        }
+                    }
+                });
 
             // The menu bar uses a dedicated macOS template asset instead of
             // the application icon. Template images must be black/transparent
@@ -850,39 +688,33 @@ pub fn run() {
 
             let tray = builder.build(app)?;
 
-            let display = Arc::new(
-                TrayDisplay {
-                    tray,
-                    status,
-                    weekly_title,
-                    weekly_progress,
-                    weekly_reset,
-                    today,
-                },
-            );
+            let display = Arc::new(TrayDisplay {
+                tray,
+                status,
+                weekly_title,
+                weekly_progress,
+                weekly_reset,
+                today,
+            });
 
-            start_tray_updater(
-                app,
-                Arc::clone(&client),
-                display,
-            );
+            start_tray_updater(app, display);
 
             Ok(())
         })
-
-        .invoke_handler(
-            tauri::generate_handler![
-                get_codex_snapshot,
-                get_codex_connection_status,
-                reconnect_codex
-            ],
-        )
-
-        .run(
-            tauri::generate_context!()
-        )
-
-        .expect(
-            "error while running tauri application"
-        );
+        .invoke_handler(tauri::generate_handler![
+            get_codex_snapshot,
+            get_codex_connection_status,
+            reconnect_codex,
+            get_monitor_settings,
+            save_monitor_settings,
+            get_usage_scheduler_status,
+            get_cached_codex_snapshot,
+            refresh_usage_now,
+            get_usage_history,
+            get_usage_analytics,
+            get_usage_analytics_v1,
+            get_daily_model_usage
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }

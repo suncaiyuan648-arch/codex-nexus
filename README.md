@@ -841,20 +841,27 @@ Legend:
 
 ### V0.2 — Desktop Experience
 
-* [ ] Account change detection
-* [ ] Better connection status UI
-* [ ] Tray quota display
-* [ ] Usage threshold notifications
-* [ ] Quota reset notification
-* [ ] Close to tray
-* [ ] Launch at startup
+* [x] Account change detection
+* [x] Better connection status UI
+* [x] Tray quota display
+* [x] Usage threshold notifications with persistent deduplication
+* [x] Quota reset detection and notification
+* [x] Close to tray
+* [x] Launch at startup
+* [x] Start minimized
 
 ### V0.3 — Usage Intelligence
 
-* [ ] Local usage history
-* [ ] 24-hour usage chart
-* [ ] 7-day history
-* [ ] 30-day history
+* [x] SQLite usage database (`AppData/Codex Usage Monitor/usage.db`)
+* [x] Official daily usage bootstrap and upsert
+* [x] Rate-limit history samples
+* [x] Incremental rollout JSONL collector with byte cursors
+* [x] Per-Turn token telemetry attribution
+* [x] 7/15/30/90-day and all-time ranges
+* [x] Model / reasoning / speed / token-type breakdowns
+* [x] 24-hour quota usage chart
+* [x] Unattributed account usage category
+* [x] Estimated remaining tokens with explicit estimate labeling
 * [ ] Usage export
 * [ ] Better usage analytics
 
@@ -865,6 +872,15 @@ Legend:
 * [ ] Account usage comparison
 * [ ] Account switching
 * [ ] Quick switch from tray
+
+### Protocol compatibility
+
+* [x] Multiple `rateLimitsByLimitId` buckets in the dashboard and history
+* [x] Display available earned reset credits
+* [ ] Consume earned reset credits (`account/rateLimitResetCredit/consume`)
+
+The reset-credit action remains a V2 item because it changes account state and
+requires an idempotency key plus a fresh rate-limit read after success.
 
 ### Future
 

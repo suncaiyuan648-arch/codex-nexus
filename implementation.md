@@ -743,6 +743,58 @@ reset credit
 
 都可以算 V1.5/V2。
 
-Snapshot 三 RPC 并发化和 `account/updated` 实时账号变化已经完成；下一步可以停止折腾 RPC 架构，把精力转到 Tray、通知和 UI 上。
+Snapshot 三 RPC 并发化和 `account/updated` 实时账号变化已经完成；现在 V1 的监控、通知、托盘和本地历史闭环也已经接上。
+
+## 当前实现状态与后续计划
+
+### 已完成
+
+1. **阈值通知**：设置页提供 80%、90%、95%、100% 选项；每个 `limitId + primary/secondary` 独立保存 `lastNotifiedThreshold`，同一阈值重复刷新不会重复通知。
+2. **Quota reset**：根据 `resetsAt` 检测窗口是否进入新的 reset 周期；reset 通知只发一次，并清空该窗口的阈值去重状态。
+3. **本地历史**：SQLite 已成为主数据源；旧的 `usage-history.json` 保留为兼容文件，不再作为分析图表的主来源。
+4. **多 bucket**：UI、托盘和历史均按 `rateLimitsByLimitId` 读取，不再假设只有 `codex` 一个 bucket。
+5. **启动与托盘**：支持 Launch at startup、Start minimized、Close window to tray；真正退出从托盘菜单执行。
+6. **打包基础**：Tauri bundle 已启用，产品名和 NSIS 图标配置已准备好；签名、公证和 universal 构建仍属于发布阶段工作。
+
+### 推荐交付顺序
+
+1. 用真实账号跑一轮 5 分钟采样，确认 AppData 文件内容和系统通知权限。
+2. 手动验证 89% → 90% → 98% → reset 后 0% 的去重与 reset 行为。
+3. 在 Windows/macOS 各做一次 debug bundle，确认托盘、关闭窗口和开机启动。
+4. 继续扩展历史导出、按模型费率计算 weighted usage，以及 quota cycle 分析。
+5. 最后实现 earned reset credit 消费：调用带 `idempotencyKey` 的 RPC，成功后重新读取 rate limits；这项属于 V2 的账户操作。
+
+### 明确不做
+
+继续复用本机 Codex 登录和 stdio App Server，不增加自有登录、ChatGPT Token 存储、后端服务器、WebSocket transport 或 Redux。多账号切换、自动更新、签名/公证也不放进当前 V1。
+
+## Usage Analyzer 实现说明
+
+当前用量系统已经从单一 JSON 快照升级为 SQLite 本地分析层，数据库位于：
+
+```text
+Tauri AppData/
+└── Codex Usage Monitor/
+    └── usage.db
+```
+
+核心表：
+
+```text
+account_daily_usage  官方账户每日总量、lifetime token
+turn_usage           本机 rollout 的 Turn token 明细
+rate_limit_samples   usedPercent / resetsAt 历史采样
+rollout_cursors      JSONL 文件 byte offset 与累计 token 状态
+```
+
+`account/usage/read` 的每日 bucket 会做 UPSERT；`account/rateLimits/read`、定时刷新和 `account/rateLimits/updated` 会写入额度采样。rollout collector 每 15 秒增量读取 `~/.codex/sessions` 和 `~/.codex/archived_sessions`，只保存 token、模型、effort、speed 状态等元数据，不保存 prompt、response 或 reasoning 内容。
+
+Token telemetry 使用 session cumulative total 与 cursor 中保存的上一状态计算 Turn 增量，因此应用重启、重复事件和重复扫描不会再次累计。当前 rollout 如果没有可靠 service tier，会保存为 `Unknown`；配置了 priority/fast 只标记为 `Fast requested`，不伪装成已确认的有效速度。
+
+历史分析支持 `7D / 15D / 30D / 90D / ALL`，以及 Model、Reasoning、Speed、Token Type 四种分类。官方账户总量与本机可归因 Turn 不一致时，差额显示为 `Unattributed`，不会强行分配给某个模型。
+
+剩余 Token 不是官方字段。只有当 SQLite 中积累至少两个有效的“本地 Token 增量 / usedPercent 增量”区间时，界面才显示 `Estimated Remaining`；该数字始终带有估算说明，数据不足时不显示。
+
+目前仍未实现：7/30/90 天导出、按模型费率计算 weighted usage、按模型分别估算剩余量、quota_cycles 周期表，以及 earned reset credit 的消费 RPC。这些功能建立在当前 SQLite 数据基础上继续扩展。
 
 [1]: https://developers.openai.com/codex/app-server "Codex App Server | ChatGPT Learn"

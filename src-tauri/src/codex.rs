@@ -8,8 +8,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
-        mpsc,
-        Arc, Condvar, Mutex, Weak,
+        mpsc, Arc, Condvar, Mutex, Weak,
     },
     thread,
     time::Duration,
@@ -91,20 +90,10 @@ impl CodexRpcClient {
             display_path: Mutex::new(None),
         });
 
-        client.set_status(
-            "connecting",
-            0,
-            None,
-            None,
-        );
+        client.set_status("connecting", 0, None, None);
 
         if let Err(error) = client.establish_connection(0) {
-            client.set_status(
-                "disconnected",
-                0,
-                Some(error.clone()),
-                None,
-            );
+            client.set_status("disconnected", 0, Some(error.clone()), None);
 
             eprintln!("[Codex RPC] initial connection failed: {error}");
             client.schedule_reconnect();
@@ -113,11 +102,7 @@ impl CodexRpcClient {
         client
     }
 
-    pub fn request(
-        self: &Arc<Self>,
-        method: &str,
-        params: Option<Value>,
-    ) -> RpcResult {
+    pub fn request(self: &Arc<Self>, method: &str, params: Option<Value>) -> RpcResult {
         let status = self.status();
 
         if status.phase != "ready" {
@@ -127,11 +112,7 @@ impl CodexRpcClient {
             ));
         }
 
-        self.request_internal(
-            method,
-            params,
-            REQUEST_TIMEOUT,
-        )
+        self.request_internal(method, params, REQUEST_TIMEOUT)
     }
 
     pub fn status(&self) -> ConnectionStatus {
@@ -152,9 +133,7 @@ impl CodexRpcClient {
 
         let status = self.status();
 
-        if status.phase != "disconnected"
-            && status.phase != "reconnecting"
-        {
+        if status.phase != "disconnected" && status.phase != "reconnecting" {
             return Err(format!(
                 "Codex connection is not disconnected (state={})",
                 status.phase
@@ -185,16 +164,17 @@ impl CodexRpcClient {
             .and_then(|value| value.clone())
     }
 
-    fn establish_connection(
-        self: &Arc<Self>,
-        attempt: u32,
-    ) -> Result<(), String> {
+    fn establish_connection(self: &Arc<Self>, attempt: u32) -> Result<(), String> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err("Codex RPC client is shutting down".into());
         }
 
         self.set_status(
-            if attempt == 0 { "connecting" } else { "reconnecting" },
+            if attempt == 0 {
+                "connecting"
+            } else {
+                "reconnecting"
+            },
             attempt,
             None,
             None,
@@ -204,24 +184,13 @@ impl CodexRpcClient {
         let mut child = spawn_app_server(&command)?;
         let pid = child.id();
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or("Codex stdin unavailable")?;
+        let stdin = child.stdin.take().ok_or("Codex stdin unavailable")?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("Codex stdout unavailable")?;
+        let stdout = child.stdout.take().ok_or("Codex stdout unavailable")?;
 
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or("Codex stderr unavailable")?;
+        let stderr = child.stderr.take().ok_or("Codex stderr unavailable")?;
 
-        let generation = self
-            .next_generation
-            .fetch_add(1, Ordering::Relaxed);
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
 
         let (writer_tx, writer_rx) = mpsc::channel::<Value>();
 
@@ -257,8 +226,7 @@ impl CodexRpcClient {
             *path = Some(command.display_path.clone());
         }
 
-        self.active_generation
-            .store(generation, Ordering::Release);
+        self.active_generation.store(generation, Ordering::Release);
 
         println!(
             "[Codex RPC] app-server started generation={generation} pid={pid} path={}",
@@ -269,12 +237,7 @@ impl CodexRpcClient {
         self.spawn_stdout_reader(generation, stdout);
         self.spawn_stderr_reader(stderr);
 
-        self.set_status(
-            "initializing",
-            attempt,
-            None,
-            None,
-        );
+        self.set_status("initializing", attempt, None, None);
 
         let initialize_result = self.request_internal(
             "initialize",
@@ -289,19 +252,12 @@ impl CodexRpcClient {
         );
 
         if let Err(error) = initialize_result {
-            self.disconnect_generation(
-                generation,
-                format!("initialize failed: {error}"),
-                false,
-            );
+            self.disconnect_generation(generation, format!("initialize failed: {error}"), false);
 
             return Err(error);
         }
 
-        if let Err(error) = self.notify_internal(
-            "initialized",
-            Some(json!({})),
-        ) {
+        if let Err(error) = self.notify_internal("initialized", Some(json!({}))) {
             self.disconnect_generation(
                 generation,
                 format!("initialized notification failed: {error}"),
@@ -311,16 +267,9 @@ impl CodexRpcClient {
             return Err(error);
         }
 
-        self.set_status(
-            "ready",
-            attempt,
-            None,
-            None,
-        );
+        self.set_status("ready", attempt, None, None);
 
-        println!(
-            "[Codex RPC] ready generation={generation}"
-        );
+        println!("[Codex RPC] ready generation={generation}");
 
         Ok(())
     }
@@ -339,10 +288,7 @@ impl CodexRpcClient {
             for message in writer_rx {
                 if let Err(error) = write_rpc(&mut stdin, message) {
                     if let Some(client) = weak.upgrade() {
-                        client.transport_failed(
-                            generation,
-                            format!("stdin write failed: {error}"),
-                        );
+                        client.transport_failed(generation, format!("stdin write failed: {error}"));
                     }
 
                     break;
@@ -383,9 +329,7 @@ impl CodexRpcClient {
                     Ok(message) => message,
 
                     Err(error) => {
-                        eprintln!(
-                            "[Codex RPC] invalid JSON generation={generation}: {error}"
-                        );
+                        eprintln!("[Codex RPC] invalid JSON generation={generation}: {error}");
                         continue;
                     }
                 };
@@ -394,25 +338,16 @@ impl CodexRpcClient {
                     return;
                 };
 
-                client.handle_message(
-                    generation,
-                    message,
-                );
+                client.handle_message(generation, message);
             }
 
             if let Some(client) = weak.upgrade() {
-                client.transport_failed(
-                    generation,
-                    "stdout closed".into(),
-                );
+                client.transport_failed(generation, "stdout closed".into());
             }
         });
     }
 
-    fn spawn_stderr_reader(
-        &self,
-        stderr: impl std::io::Read + Send + 'static,
-    ) {
+    fn spawn_stderr_reader(&self, stderr: impl std::io::Read + Send + 'static) {
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 match line {
@@ -439,19 +374,12 @@ impl CodexRpcClient {
         });
     }
 
-    fn handle_message(
-        self: &Arc<Self>,
-        generation: u64,
-        message: Value,
-    ) {
+    fn handle_message(self: &Arc<Self>, generation: u64, message: Value) {
         if self.active_generation.load(Ordering::Acquire) != generation {
             return;
         }
 
-        if let Some(id) = message
-            .get("id")
-            .and_then(Value::as_i64)
-        {
+        if let Some(id) = message.get("id").and_then(Value::as_i64) {
             if message.get("method").is_some() {
                 eprintln!(
                     "[Codex RPC] unhandled server request generation={generation}: {message}"
@@ -465,12 +393,7 @@ impl CodexRpcClient {
             let result = if let Some(error) = message.get("error") {
                 Err(error.to_string())
             } else {
-                Ok(
-                    message
-                        .get("result")
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                )
+                Ok(message.get("result").cloned().unwrap_or(Value::Null))
             };
 
             let sender = self
@@ -486,10 +409,7 @@ impl CodexRpcClient {
             return;
         }
 
-        let Some(method) = message
-            .get("method")
-            .and_then(Value::as_str)
-        else {
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
             return;
         };
 
@@ -500,13 +420,12 @@ impl CodexRpcClient {
             if let Some(params) = message.get("params") {
                 println!("[Codex RPC] rate limits updated");
 
-                if let Err(error) = self.app.emit(
-                    "codex://rate-limits-updated",
-                    params.clone(),
-                ) {
-                    eprintln!(
-                        "[Tauri] failed to emit rate-limit update: {error}"
-                    );
+                if let Err(error) = crate::usage::record_rate_limit_update(&self.app, params) {
+                    eprintln!("[Usage] failed to record rate-limit update: {error}");
+                }
+
+                if let Err(error) = self.app.emit("codex://rate-limits-updated", params.clone()) {
+                    eprintln!("[Tauri] failed to emit rate-limit update: {error}");
                 }
             }
         }
@@ -516,14 +435,9 @@ impl CodexRpcClient {
 
             if let Err(error) = self.app.emit(
                 "codex://account-updated",
-                message
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(Value::Null),
+                message.get("params").cloned().unwrap_or(Value::Null),
             ) {
-                eprintln!(
-                    "[Tauri] failed to emit account update: {error}"
-                );
+                eprintln!("[Tauri] failed to emit account update: {error}");
             }
         }
     }
@@ -534,10 +448,7 @@ impl CodexRpcClient {
         params: Option<Value>,
         timeout: Duration,
     ) -> RpcResult {
-        let id = self.next_id.fetch_add(
-            1,
-            Ordering::Relaxed,
-        );
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         let generation = self.active_generation.load(Ordering::Acquire);
 
@@ -545,8 +456,7 @@ impl CodexRpcClient {
             return Err("Codex transport is disconnected".into());
         }
 
-        let (response_tx, response_rx) =
-            mpsc::channel::<RpcResult>();
+        let (response_tx, response_rx) = mpsc::channel::<RpcResult>();
 
         {
             let mut pending = self
@@ -554,10 +464,7 @@ impl CodexRpcClient {
                 .lock()
                 .map_err(|_| "Codex pending map poisoned".to_string())?;
 
-            pending.insert(
-                id,
-                response_tx,
-            );
+            pending.insert(id, response_tx);
         }
 
         let mut message = json!({
@@ -582,10 +489,7 @@ impl CodexRpcClient {
         if let Err(error) = writer.send(message) {
             self.remove_pending(id);
 
-            self.transport_failed(
-                generation,
-                format!("writer channel disconnected: {error}"),
-            );
+            self.transport_failed(generation, format!("writer channel disconnected: {error}"));
 
             return Err("Codex writer disconnected".into());
         }
@@ -596,14 +500,9 @@ impl CodexRpcClient {
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.remove_pending(id);
 
-                self.transport_failed(
-                    generation,
-                    format!("RPC `{method}` timed out"),
-                );
+                self.transport_failed(generation, format!("RPC `{method}` timed out"));
 
-                Err(format!(
-                    "Timed out waiting for Codex RPC `{method}`"
-                ))
+                Err(format!("Timed out waiting for Codex RPC `{method}`"))
             }
 
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -614,18 +513,12 @@ impl CodexRpcClient {
                     format!("RPC `{method}` response channel disconnected"),
                 );
 
-                Err(format!(
-                    "Codex RPC `{method}` disconnected"
-                ))
+                Err(format!("Codex RPC `{method}` disconnected"))
             }
         }
     }
 
-    fn notify_internal(
-        &self,
-        method: &str,
-        params: Option<Value>,
-    ) -> Result<(), String> {
+    fn notify_internal(&self, method: &str, params: Option<Value>) -> Result<(), String> {
         let mut message = json!({
             "method": method
         });
@@ -643,25 +536,15 @@ impl CodexRpcClient {
 
         writer
             .send(message)
-            .map_err(|error| {
-                format!("Codex writer unavailable: {error}")
-            })
+            .map_err(|error| format!("Codex writer unavailable: {error}"))
     }
 
-    fn transport_failed(
-        self: &Arc<Self>,
-        generation: u64,
-        reason: String,
-    ) {
+    fn transport_failed(self: &Arc<Self>, generation: u64, reason: String) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
 
-        self.disconnect_generation(
-            generation,
-            reason,
-            true,
-        );
+        self.disconnect_generation(generation, reason, true);
     }
 
     fn disconnect_generation(
@@ -670,21 +553,15 @@ impl CodexRpcClient {
         reason: String,
         schedule_reconnect: bool,
     ) {
-        if self.active_generation
-            .compare_exchange(
-                generation,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+        if self
+            .active_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
 
-        eprintln!(
-            "[Codex RPC] disconnected generation={generation}: {reason}"
-        );
+        eprintln!("[Codex RPC] disconnected generation={generation}: {reason}");
 
         if let Ok(mut writer) = self.writer.lock() {
             *writer = None;
@@ -697,33 +574,21 @@ impl CodexRpcClient {
             }
         }
 
-        self.fail_all_pending(
-            format!("Codex disconnected: {reason}")
-        );
+        self.fail_all_pending(format!("Codex disconnected: {reason}"));
 
-        self.set_status(
-            "disconnected",
-            0,
-            Some(reason),
-            None,
-        );
+        self.set_status("disconnected", 0, Some(reason), None);
 
         if schedule_reconnect {
             self.schedule_reconnect();
         }
     }
 
-    fn schedule_reconnect(
-        self: &Arc<Self>,
-    ) {
+    fn schedule_reconnect(self: &Arc<Self>) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
 
-        if self.reconnecting.swap(
-            true,
-            Ordering::AcqRel,
-        ) {
+        if self.reconnecting.swap(true, Ordering::AcqRel) {
             return;
         }
 
@@ -768,9 +633,7 @@ impl CodexRpcClient {
                 );
 
                 if !forced && client.wait_for_reconnect(delay) {
-                    println!(
-                        "[Codex RPC] manual reconnect requested"
-                    );
+                    println!("[Codex RPC] manual reconnect requested");
                 }
 
                 if client.shutting_down.load(Ordering::Acquire) {
@@ -781,29 +644,17 @@ impl CodexRpcClient {
                 match client.establish_connection(attempt) {
                     Ok(()) => {
                         client.clear_reconnect_request();
-                        client.reconnecting.store(
-                            false,
-                            Ordering::Release,
-                        );
+                        client.reconnecting.store(false, Ordering::Release);
 
-                        println!(
-                            "[Codex RPC] reconnect succeeded attempt={attempt}"
-                        );
+                        println!("[Codex RPC] reconnect succeeded attempt={attempt}");
 
                         return;
                     }
 
                     Err(error) => {
-                        eprintln!(
-                            "[Codex RPC] reconnect attempt={attempt} failed: {error}"
-                        );
+                        eprintln!("[Codex RPC] reconnect attempt={attempt} failed: {error}");
 
-                        client.set_status(
-                            "disconnected",
-                            attempt,
-                            Some(error),
-                            None,
-                        );
+                        client.set_status("disconnected", attempt, Some(error), None);
 
                         attempt = attempt.saturating_add(1);
                     }
@@ -825,8 +676,7 @@ impl CodexRpcClient {
             .ok()
             .and_then(|value| value.clone());
 
-        let generation =
-            self.active_generation.load(Ordering::Acquire);
+        let generation = self.active_generation.load(Ordering::Acquire);
 
         let status = ConnectionStatus {
             phase: phase.to_string(),
@@ -841,52 +691,34 @@ impl CodexRpcClient {
             *current = status.clone();
         }
 
-        let _ = self.app.emit(
-            "codex://connection-state",
-            status,
-        );
+        let _ = self.app.emit("codex://connection-state", status);
     }
 
-    fn fail_all_pending(
-        &self,
-        error: String,
-    ) {
+    fn fail_all_pending(&self, error: String) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
 
         for (_, sender) in pending.drain() {
-            let _ = sender.send(
-                Err(error.clone())
-            );
+            let _ = sender.send(Err(error.clone()));
         }
     }
 
-    fn remove_pending(
-        &self,
-        id: i64,
-    ) {
+    fn remove_pending(&self, id: i64) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(&id);
         }
     }
 
-    fn wait_for_reconnect(
-        &self,
-        delay: Duration,
-    ) -> bool {
+    fn wait_for_reconnect(&self, delay: Duration) -> bool {
         let Ok(requested) = self.reconnect_wait_lock.lock() else {
             thread::sleep(delay);
             return false;
         };
 
-        let Ok((mut requested, _)) = self
-            .reconnect_wait
-            .wait_timeout_while(
-                requested,
-                delay,
-                |requested| !*requested,
-            )
+        let Ok((mut requested, _)) =
+            self.reconnect_wait
+                .wait_timeout_while(requested, delay, |requested| !*requested)
         else {
             return false;
         };
@@ -915,17 +747,11 @@ impl CodexRpcClient {
 
 impl Drop for CodexRpcClient {
     fn drop(&mut self) {
-        self.shutting_down.store(
-            true,
-            Ordering::Release,
-        );
+        self.shutting_down.store(true, Ordering::Release);
 
         self.reconnect_wait.notify_all();
 
-        self.active_generation.store(
-            0,
-            Ordering::Release,
-        );
+        self.active_generation.store(0, Ordering::Release);
 
         if let Ok(mut writer) = self.writer.lock() {
             *writer = None;
@@ -940,17 +766,13 @@ impl Drop for CodexRpcClient {
 
         if let Ok(mut pending) = self.pending.lock() {
             for (_, sender) in pending.drain() {
-                let _ = sender.send(
-                    Err("Codex RPC client shutting down".into())
-                );
+                let _ = sender.send(Err("Codex RPC client shutting down".into()));
             }
         }
     }
 }
 
-fn reconnect_delay(
-    attempt: u32,
-) -> Duration {
+fn reconnect_delay(attempt: u32) -> Duration {
     let seconds = match attempt {
         0 | 1 => 1,
         2 => 2,
@@ -963,9 +785,7 @@ fn reconnect_delay(
     Duration::from_secs(seconds)
 }
 
-fn spawn_app_server(
-    command: &CodexCommand,
-) -> Result<Child, String> {
+fn spawn_app_server(command: &CodexCommand) -> Result<Child, String> {
     let mut cmd = Command::new(&command.program);
 
     cmd.args(&command.prefix_args)
@@ -974,77 +794,50 @@ fn spawn_app_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    cmd.spawn().map_err(|error| {
-        format!("Failed to start Codex app-server: {error}")
-    })
+    cmd.spawn()
+        .map_err(|error| format!("Failed to start Codex app-server: {error}"))
 }
 
-fn write_rpc(
-    stdin: &mut impl Write,
-    value: Value,
-) -> Result<(), String> {
-    let line = serde_json::to_string(&value)
-        .map_err(|error| error.to_string())?;
+fn write_rpc(stdin: &mut impl Write, value: Value) -> Result<(), String> {
+    let line = serde_json::to_string(&value).map_err(|error| error.to_string())?;
 
     stdin
         .write_all(line.as_bytes())
         .map_err(|error| error.to_string())?;
 
-    stdin
-        .write_all(b"\n")
-        .map_err(|error| error.to_string())?;
+    stdin.write_all(b"\n").map_err(|error| error.to_string())?;
 
-    stdin
-        .flush()
-        .map_err(|error| error.to_string())?;
+    stdin.flush().map_err(|error| error.to_string())?;
 
     Ok(())
 }
 
-fn path_is_file(
-    path: &Path,
-) -> bool {
+fn path_is_file(path: &Path) -> bool {
     path.metadata()
         .map(|metadata| metadata.is_file())
         .unwrap_or(false)
 }
 
-fn first_existing(
-    paths: impl IntoIterator<Item = PathBuf>,
-) -> Option<PathBuf> {
-    paths
-        .into_iter()
-        .find(|path| path_is_file(path))
+fn first_existing(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().find(|path| path_is_file(path))
 }
 
 fn path_entries_from_env() -> Vec<PathBuf> {
     env::var_os("PATH")
-        .map(|path| {
-            env::split_paths(&path)
-                .map(PathBuf::from)
-                .collect()
-        })
+        .map(|path| env::split_paths(&path).map(PathBuf::from).collect())
         .unwrap_or_default()
 }
 
 fn executable_candidates_in_path() -> Vec<PathBuf> {
     let names = if cfg!(target_os = "windows") {
-        vec![
-            "codex.exe",
-            "codex.cmd",
-            "codex.bat",
-        ]
+        vec!["codex.exe", "codex.cmd", "codex.bat"]
     } else {
         vec!["codex"]
     };
 
     path_entries_from_env()
         .into_iter()
-        .flat_map(|directory| {
-            names
-                .iter()
-                .map(move |name| directory.join(name))
-        })
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .filter(|path| path_is_file(path))
         .collect()
 }
@@ -1057,8 +850,7 @@ fn shell_path_candidates() -> Vec<PathBuf> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let shell = env::var("SHELL")
-            .unwrap_or_else(|_| "/bin/sh".into());
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
 
         let output = Command::new(shell)
             .args(["-ilc", "command -v codex"])
@@ -1089,12 +881,8 @@ fn macos_codex_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let mut candidates = vec![
-            PathBuf::from(
-                "/Applications/ChatGPT.app/Contents/Resources/codex",
-            ),
-            PathBuf::from(
-                "/Applications/Codex.app/Contents/Resources/codex",
-            ),
+            PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
         ];
 
         if let Ok(home) = env::var("HOME") {
@@ -1157,9 +945,7 @@ fn unix_codex_candidates() -> Vec<PathBuf> {
     }
 }
 
-fn resolve_codex()
-    -> Result<CodexCommand, String>
-{
+fn resolve_codex() -> Result<CodexCommand, String> {
     if let Ok(explicit) = env::var("CODEX_BIN") {
         let path = PathBuf::from(&explicit);
 
@@ -1167,71 +953,52 @@ fn resolve_codex()
             return Ok(command_for_path(path));
         }
 
-        return Err(format!(
-            "CODEX_BIN points to a missing file: {explicit}"
-        ));
+        return Err(format!("CODEX_BIN points to a missing file: {explicit}"));
     }
 
     #[cfg(target_os = "windows")]
     {
         if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
-            let native =
-                PathBuf::from(local_app_data)
-                    .join("Programs")
-                    .join("OpenAI")
-                    .join("Codex")
-                    .join("bin")
-                    .join("codex.exe");
+            let native = PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin")
+                .join("codex.exe");
 
             if path_is_file(&native) {
                 return Ok(command_for_path(native));
             }
         }
 
-        if let Ok(output) =
-            Command::new("where.exe")
-                .arg("codex")
-                .output()
-        {
+        if let Ok(output) = Command::new("where.exe").arg("codex").output() {
             if output.status.success() {
-                let paths: Vec<PathBuf> =
-                    String::from_utf8_lossy(&output.stdout)
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(PathBuf::from)
-                        .filter(|path| path_is_file(path))
-                        .collect();
+                let paths: Vec<PathBuf> = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(PathBuf::from)
+                    .filter(|path| path_is_file(path))
+                    .collect();
 
-                if let Some(exe) =
-                    paths.iter().find(|path| {
-                        path.extension()
-                            .and_then(|ext| ext.to_str())
-                            .map(|ext| {
-                                ext.eq_ignore_ascii_case("exe")
-                            })
-                            .unwrap_or(false)
-                    })
-                {
-                    return Ok(
-                        command_for_path(exe.clone())
-                    );
+                if let Some(exe) = paths.iter().find(|path| {
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("exe"))
+                        .unwrap_or(false)
+                }) {
+                    return Ok(command_for_path(exe.clone()));
                 }
 
-                if let Some(script) =
-                    paths.iter().find(|path| {
-                        path.extension()
-                            .and_then(|ext| ext.to_str())
-                            .map(|ext| {
-                                ext.eq_ignore_ascii_case("cmd")
-                                    || ext.eq_ignore_ascii_case("bat")
-                            })
-                            .unwrap_or(false)
-                    })
-                {
-                    return Ok(
-                        command_for_path(script.clone())
-                    );
+                if let Some(script) = paths.iter().find(|path| {
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| {
+                            ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                        })
+                        .unwrap_or(false)
+                }) {
+                    return Ok(command_for_path(script.clone()));
                 }
             }
         }
@@ -1239,11 +1006,7 @@ fn resolve_codex()
         let mut candidates = Vec::new();
 
         if let Ok(appdata) = env::var("APPDATA") {
-            candidates.push(
-                PathBuf::from(appdata)
-                    .join("npm")
-                    .join("codex.cmd"),
-            );
+            candidates.push(PathBuf::from(appdata).join("npm").join("codex.cmd"));
         }
 
         if let Some(path) = first_existing(candidates) {
@@ -1270,27 +1033,21 @@ fn resolve_codex()
     )
 }
 
-fn command_for_path(
-    path: PathBuf,
-) -> CodexCommand {
-    let display_path =
-        path.to_string_lossy().to_string();
+fn command_for_path(path: PathBuf) -> CodexCommand {
+    let display_path = path.to_string_lossy().to_string();
 
     #[cfg(target_os = "windows")]
     {
-        let ext =
-            path.extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
 
         if ext == "cmd" || ext == "bat" {
             return CodexCommand {
                 program: "cmd.exe".into(),
-                prefix_args: vec![
-                    "/C".into(),
-                    display_path.clone(),
-                ],
+                prefix_args: vec!["/C".into(), display_path.clone()],
                 display_path,
             };
         }

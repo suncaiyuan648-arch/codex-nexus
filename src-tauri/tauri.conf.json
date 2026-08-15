@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex 监控",
+  "productName": "Codex Usage Monitor",
   "version": "0.1.0",
   "identifier": "com.local.codexnexus",
   "build": {
