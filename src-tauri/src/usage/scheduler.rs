@@ -109,6 +109,9 @@ pub struct UsageSchedulerState {
 
 #[derive(Clone, Debug)]
 struct QuotaMarker {
+    limit_id: String,
+    window: String,
+    window_duration_mins: i64,
     used_percent: f64,
     resets_at: Option<i64>,
 }
@@ -472,16 +475,21 @@ fn latest_weekly_quota_marker(app: &AppHandle<Wry>) -> Option<QuotaMarker> {
     let account_key = recorder::current_account_key(&connection).ok()??;
     connection
         .query_row(
-            "SELECT used_percent, resets_at
+            "SELECT limit_id, window, window_duration_mins, used_percent, resets_at
              FROM rate_limit_samples
-             WHERE account_key = ?1 AND window = 'primary'
-               AND window_duration_mins = 10080
+             WHERE account_key = ?1 AND window_duration_mins = 10080
              ORDER BY sampled_at DESC, id DESC LIMIT 1",
             [&account_key],
             |row| {
-                let used_percent: f64 = row.get(0)?;
-                let resets_at: Option<i64> = row.get(1)?;
+                let limit_id: String = row.get(0)?;
+                let window: String = row.get(1)?;
+                let window_duration_mins: i64 = row.get(2)?;
+                let used_percent: f64 = row.get(3)?;
+                let resets_at: Option<i64> = row.get(4)?;
                 Ok(QuotaMarker {
+                    limit_id,
+                    window,
+                    window_duration_mins,
                     used_percent,
                     resets_at,
                 })
@@ -495,7 +503,10 @@ fn quota_marker_changed(before: &Option<QuotaMarker>, after: &Option<QuotaMarker
         (None, None) => false,
         (None, Some(_)) | (Some(_), None) => true,
         (Some(before), Some(after)) => {
-            (before.used_percent - after.used_percent).abs() > f64::EPSILON
+            before.limit_id != after.limit_id
+                || before.window != after.window
+                || before.window_duration_mins != after.window_duration_mins
+                || (before.used_percent - after.used_percent).abs() > f64::EPSILON
                 || !quota::same_reset_at(before.resets_at, after.resets_at)
         }
     }

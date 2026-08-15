@@ -72,6 +72,7 @@ pub struct UsageMetric {
     pub status: String,
     pub value: Option<f64>,
     pub sample_count: i64,
+    pub change_count: i64,
     pub confidence: Confidence,
     pub source: String,
 }

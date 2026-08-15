@@ -279,23 +279,23 @@ fn load_intervals(
 fn category_for(breakdown: &str, turn: &TurnRow) -> String {
     match breakdown {
         "reasoning" => match turn.reasoning_effort.as_str() {
-            "low" => "Low",
-            "medium" => "Medium",
-            "high" => "High",
-            "xhigh" => "XHigh",
-            "ultra" => "Ultra",
-            _ => "Unknown",
+            "low" => "低",
+            "medium" => "中",
+            "high" => "高",
+            "xhigh" => "极高",
+            "ultra" => "超高",
+            _ => "未知",
         }
         .into(),
         "speed" => match turn.speed_mode.as_str() {
-            "standard" => "Standard",
-            "fast_requested" => "Fast requested",
-            _ => "Unknown",
+            "standard" => "标准",
+            "fast_requested" => "已请求快速模式",
+            _ => "未知",
         }
         .into(),
         "account" => turn.account_key.clone(),
-        "tokenType" => "All tokens".into(),
-        _ => turn.model.clone().unwrap_or_else(|| "Unknown".into()),
+        "tokenType" => "全部 Token".into(),
+        _ => turn.model.clone().unwrap_or_else(|| "未知".into()),
     }
 }
 
@@ -340,13 +340,13 @@ fn add_turn_tokens(
         return;
     }
     let parts = [
-        ("Input", turn.input_tokens),
-        ("Cached", turn.cached_input_tokens),
+        ("输入", turn.input_tokens),
+        ("缓存输入", turn.cached_input_tokens),
         (
-            "Output",
+            "输出",
             (turn.output_tokens - turn.reasoning_output_tokens).max(0),
         ),
-        ("Reasoning", turn.reasoning_output_tokens),
+        ("推理", turn.reasoning_output_tokens),
     ];
     for (category, raw) in parts {
         if raw > 0 {

@@ -529,6 +529,7 @@ fn daily_quota_usage(
     let samples = rows.filter_map(Result::ok).collect::<Vec<_>>();
     let mut observed_percent = 0.0;
     let mut sample_count = 0;
+    let mut change_count = 0;
     for pair in samples.windows(2) {
         let previous = &pair[0];
         let current = &pair[1];
@@ -541,7 +542,11 @@ fn daily_quota_usage(
             continue;
         }
         sample_count += 1;
-        observed_percent += current.used_percent - previous.used_percent;
+        let delta = current.used_percent - previous.used_percent;
+        if delta > f64::EPSILON {
+            change_count += 1;
+        }
+        observed_percent += delta;
     }
     if sample_count == 0 {
         return insufficient_quota_metric();
@@ -550,6 +555,7 @@ fn daily_quota_usage(
         status: USAGE_STATUS_OBSERVED.into(),
         value: Some(observed_percent),
         sample_count,
+        change_count,
         confidence: if sample_count >= 3 {
             Confidence::High
         } else {
@@ -564,6 +570,7 @@ fn insufficient_quota_metric() -> UsageMetric {
         status: USAGE_STATUS_INSUFFICIENT_DATA.into(),
         value: None,
         sample_count: 0,
+        change_count: 0,
         confidence: Confidence::Low,
         source: PROVENANCE_ACCOUNT_RATE_LIMIT.into(),
     }
@@ -875,6 +882,37 @@ mod tests {
             server_category_deltas(&connection, Some("a"), 150, 250).unwrap();
         assert!(!available);
         assert!(categories.is_empty());
+    }
+
+    #[test]
+    fn daily_quota_usage_separates_changes_from_valid_sample_intervals() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO rate_limit_samples
+                 (account_key, sampled_at, limit_id, window, window_duration_mins,
+                  used_percent, resets_at, source, confidence)
+                 VALUES
+                   ('a', 100, 'weekly', 'secondary', 10080, 10, 20000, 'account_rate_limit', 'high'),
+                   ('a', 200, 'weekly', 'secondary', 10080, 10, 20000, 'account_rate_limit', 'high'),
+                   ('a', 300, 'weekly', 'secondary', 10080, 11, 20000, 'account_rate_limit', 'high'),
+                   ('a', 400, 'weekly', 'secondary', 10080, 11, 20000, 'account_rate_limit', 'high')",
+                [],
+            )
+            .unwrap();
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "secondary".into(),
+            used_percent: 11.0,
+            remaining_percent: 89.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let metric = daily_quota_usage(&connection, Some("a"), 100, 500, Some(&quota_window));
+        assert_eq!(metric.value, Some(1.0));
+        assert_eq!(metric.sample_count, 3);
+        assert_eq!(metric.change_count, 1);
     }
 
     #[test]

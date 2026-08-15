@@ -40,6 +40,61 @@ import {
 
 import codexIconBody from "../assets/branding/app/app-icon-master.png";
 
+function confidenceLabel(value: string): string {
+  switch (value) {
+    case "high":
+      return "高";
+    case "medium":
+      return "中";
+    case "low":
+      return "低";
+    default:
+      return "未知";
+  }
+}
+
+function reasoningLabel(value: string): string {
+  switch (value) {
+    case "low":
+      return "低";
+    case "medium":
+      return "中";
+    case "high":
+      return "高";
+    case "xhigh":
+      return "极高";
+    case "ultra":
+      return "超高";
+    default:
+      return "未知";
+  }
+}
+
+function modelLabel(value: string): string {
+  return value === "unknown" ? "未知模型" : value;
+}
+
+function refreshPolicyLabel(value: string): string {
+  switch (value) {
+    case "adaptive":
+      return "自适应实时";
+    case "15s":
+      return "每 15 秒";
+    case "30s":
+      return "每 30 秒";
+    case "1m":
+      return "每 1 分钟";
+    case "3m":
+      return "每 3 分钟";
+    case "5m":
+      return "每 5 分钟";
+    case "5s":
+      return "每 5 秒";
+    default:
+      return value;
+  }
+}
+
 /*
  * ============================================================
  * Quota Card
@@ -139,13 +194,13 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
 
       {usage?.periodSource === "insufficient_data" ? (
         <p className="quota-estimate-warning">
-          未观测到可由 windowDurationMins + resetsAt 确认的当前 Codex 周额度窗口；严格周统计暂不使用自然周或最近 7 天回退数据。
+          未观测到可由窗口时长与重置时间确认的当前 Codex 周额度窗口；严格周统计暂不使用自然周或最近 7 天回退数据。
         </p>
       ) : null}
 
       {!categories.length ? (
         <p className="muted small daily-model-usage-empty">
-          {usage ? "当前额度周期暂无本地 Turn Token 记录。" : "正在读取本额度周期…"}
+          {usage ? "当前额度周期暂无本地轮次 Token 记录。" : "正在读取本额度周期…"}
         </p>
       ) : (
         <div className="quota-estimate-list">
@@ -159,20 +214,20 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
               >
                 <div className="daily-model-usage-label">
                   <strong>
-                    {category.model}
+                    {modelLabel(category.model)}
                     <span className="daily-model-usage-reasoning">
-                      ({category.reasoningEffort})
+                      ({reasoningLabel(category.reasoningEffort)})
                     </span>
-                    {category.fast ? <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span> : null}
+                    {category.fast ? <span className="fast-badge" title="快速模式" aria-label="快速模式">⚡</span> : null}
                   </strong>
                   <span className="muted tiny">
-                    {category.turnCount} 个 Turn · {formatNumber(category.tokens)} real tokens
+                    {category.turnCount} 个轮次 · {formatNumber(category.tokens)} 真实 Token
                   </span>
                 </div>
                 <div className="daily-model-usage-values">
-                  <strong>{estimated ? `≈ ${formatNumber(estimate.estimatedTokens!)} tokens` : statusText(estimate?.status ?? "insufficient_data")}</strong>
+                  <strong>{estimated ? `≈ ${formatNumber(estimate.estimatedTokens!)} Token` : statusText(estimate?.status ?? "insufficient_data")}</strong>
                   {estimated ? (
-                    <span className="muted tiny">预估 · {estimate!.validSampleCount} 个有效额度样本 · {estimate!.confidence} confidence</span>
+                    <span className="muted tiny">预估 · {estimate!.validSampleCount} 个有效额度样本 · 置信度 {confidenceLabel(estimate!.confidence)}</span>
                   ) : null}
                 </div>
               </div>
@@ -194,10 +249,10 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
             return (
               <div className="quota-estimate-remaining-row" key={`${category.model}:${category.reasoningEffort}:${category.speedMode}`}>
                 <span>
-                  {category.model} ({category.reasoningEffort})
-                  {category.fast ? <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span> : null}
+                  {modelLabel(category.model)} ({reasoningLabel(category.reasoningEffort)})
+                  {category.fast ? <span className="fast-badge" title="快速模式" aria-label="快速模式">⚡</span> : null}
                 </span>
-                <strong>{remaining ? `≈ ${formatNumber(estimate.remainingTokens!)} tokens` : statusText(estimate?.status ?? "insufficient_data")}</strong>
+                <strong>{remaining ? `≈ ${formatNumber(estimate.remainingTokens!)} Token` : statusText(estimate?.status ?? "insufficient_data")}</strong>
               </div>
             );
           }) : (
@@ -229,7 +284,7 @@ function TodayCodexUsageCard({
     <section className="quota-card daily-model-usage-card">
       <div className="row quota-head">
         <div>
-          <div className="eyebrow">Usage · Local calendar day</div>
+          <div className="eyebrow">使用情况 · 本地自然日</div>
           <h2>今日 Codex 使用情况</h2>
         </div>
         <div className="muted tiny">{loading ? "同步中…" : `${usage?.categories.length ?? 0} 类`}</div>
@@ -241,24 +296,24 @@ function TodayCodexUsageCard({
           <strong>{formatObservedQuota}</strong>
           <span className="muted tiny">
             {quotaObserved
-              ? `Observed · ${quota!.sampleCount} 个 rateLimits 变化样本`
+              ? `已观测 · ${quota!.changeCount} 次额度变化 · ${quota!.sampleCount} 个有效采样区间`
               : usage
-                ? "Insufficient data · 仅接受真实 rateLimits 变化"
-                : "正在读取真实 rateLimits 样本…"}
+                ? "数据不足 · 仅接受真实额度采样"
+                : "正在读取真实额度采样…"}
           </span>
         </div>
         <div className="usage-account-metric">
           <span className="eyebrow">今日消耗 Token 量</span>
           <strong>{usage ? formatNumber(tokenUsage?.valueTokens ?? 0) : "—"}</strong>
           <span className="muted tiny">
-            {usage ? `Observed · ${tokenUsage?.sampleCount ?? 0} 个本地 Turn` : "正在读取本地 JSONL / rollout…"}
+            {usage ? `已观测 · ${tokenUsage?.sampleCount ?? 0} 个本地轮次` : "正在读取本地 JSONL / 运行记录…"}
           </span>
         </div>
       </div>
 
       {!usage?.categories.length ? (
         <p className="muted small daily-model-usage-empty">
-          {loading ? "正在读取今日分类用量…" : "今日暂无可用的本地 Turn Token 数据。"}
+          {loading ? "正在读取今日分类用量…" : "今日暂无可用的本地轮次 Token 数据。"}
         </p>
       ) : (
         <div className="daily-model-usage-list">
@@ -270,14 +325,14 @@ function TodayCodexUsageCard({
               <div className="daily-model-usage-label">
                 <strong>
                   {category.model}
-                  <span className="daily-model-usage-reasoning">({category.reasoningEffort})</span>
-                  {category.fast ? <span className="fast-badge" title="Fast mode" aria-label="Fast mode">⚡</span> : null}
+                  <span className="daily-model-usage-reasoning">({reasoningLabel(category.reasoningEffort)})</span>
+                  {category.fast ? <span className="fast-badge" title="快速模式" aria-label="快速模式">⚡</span> : null}
                 </strong>
-                <span className="muted tiny">{category.turnCount} 个 Turn</span>
+                <span className="muted tiny">{category.turnCount} 个轮次</span>
               </div>
               <div className="daily-model-usage-values">
-                <strong>{formatNumber(category.tokens)} tokens</strong>
-                <span className="muted tiny">Token 来源：本地 JSONL / rollout</span>
+                <strong>{formatNumber(category.tokens)} Token</strong>
+                <span className="muted tiny">Token 来源：本地 JSONL / 运行记录</span>
               </div>
             </div>
           ))}
@@ -285,7 +340,7 @@ function TodayCodexUsageCard({
       )}
 
       <div className="daily-model-usage-footnote muted tiny">
-        今日额度量仅显示账号级 Observed rateLimits 变化；没有将 Token 占比反推为模型额度。
+        今日额度量仅显示账号级已观测额度变化；没有将 Token 占比反推为模型额度。
       </div>
     </section>
   );
@@ -347,7 +402,7 @@ function HomeUsageBreakdown({
         </QuotaCard>
       ) : (
         <section className="quota-card">
-          <div className="eyebrow">Weekly quota</div>
+          <div className="eyebrow">周额度</div>
           <h2>周额度</h2>
           <p className="muted small">未返回当前账号的周额度窗口，无法显示账号级剩余百分比。</p>
           <WeeklyTokenEstimateSection usage={weeklyUsage} />
@@ -396,13 +451,13 @@ function SettingsPanel({
           {saving
             ? "保存中…"
             : schedulerStatus
-              ? `${schedulerStatus.watcherActive ? "实时监听" : "周期校准"} · ${schedulerStatus.policy}`
+              ? `${schedulerStatus.watcherActive ? "实时监听" : "周期校准"} · ${refreshPolicyLabel(schedulerStatus.policy)}`
               : "已保存到本机"}
         </div>
       </div>
 
       <div className="settings-group">
-        <div className="eyebrow">Notify me at</div>
+        <div className="eyebrow">通知阈值</div>
         <div className="threshold-grid">
           {NOTIFICATION_THRESHOLDS.map((threshold) => (
             <label className="check-pill" key={threshold}>
@@ -419,7 +474,7 @@ function SettingsPanel({
 
       <label className="setting-row">
         <span>
-          <strong>Quota reset notifications</strong>
+          <strong>额度重置通知</strong>
           <small>额度窗口重置后通知一次，并清空该窗口的阈值去重状态。</small>
         </span>
         <input
@@ -433,11 +488,11 @@ function SettingsPanel({
       </label>
 
       <div className="settings-group">
-        <div className="eyebrow">Usage refresh</div>
+        <div className="eyebrow">用量刷新</div>
         <label className="setting-row">
           <span>
-            <strong>Refresh policy</strong>
-            <small>事件驱动采集本地 Turn Token，周期校准由 Rust 调度器负责。</small>
+            <strong>刷新策略</strong>
+            <small>事件驱动采集本地轮次 Token，周期校准由 Rust 调度器负责。</small>
           </span>
           <select
             value={settings.usageRefreshPolicy === "5s" ? "adaptive" : settings.usageRefreshPolicy}
@@ -446,19 +501,19 @@ function SettingsPanel({
               usageRefreshPolicy: event.target.value,
             })}
           >
-            <option value="adaptive">Adaptive Realtime (Experimental)</option>
-            <option value="15s">15s</option>
-            <option value="30s">30s</option>
-            <option value="1m">1m</option>
-            <option value="3m">3m</option>
-            <option value="5m">5m</option>
+            <option value="adaptive">自适应实时（实验性）</option>
+            <option value="15s">每 15 秒</option>
+            <option value="30s">每 30 秒</option>
+            <option value="1m">每 1 分钟</option>
+            <option value="3m">每 3 分钟</option>
+            <option value="5m">每 5 分钟</option>
           </select>
         </label>
         <details>
-          <summary>Advanced</summary>
+          <summary>高级设置</summary>
           <label className="setting-row">
             <span>
-              <strong>5s fallback</strong>
+              <strong>5 秒备用刷新</strong>
               <small>仅用于短时诊断，后台仍由 Rust Scheduler 管理。</small>
             </span>
             <select
@@ -468,8 +523,8 @@ function SettingsPanel({
                 usageRefreshPolicy: event.target.value || "adaptive",
               })}
             >
-              <option value="">Disabled</option>
-              <option value="5s">5s</option>
+              <option value="">已禁用</option>
+              <option value="5s">每 5 秒</option>
             </select>
           </label>
         </details>
@@ -477,7 +532,7 @@ function SettingsPanel({
 
       <label className="setting-row">
         <span>
-          <strong>Launch at startup</strong>
+          <strong>开机启动</strong>
           <small>使用系统启动项启动后台监控。</small>
         </span>
         <input
@@ -492,7 +547,7 @@ function SettingsPanel({
 
       <label className="setting-row">
         <span>
-          <strong>Start minimized</strong>
+          <strong>启动时最小化</strong>
           <small>启动后隐藏主窗口，只保留托盘监控。</small>
         </span>
         <input
@@ -507,7 +562,7 @@ function SettingsPanel({
 
       <label className="setting-row">
         <span>
-          <strong>Close window to tray</strong>
+          <strong>关闭窗口时隐藏到托盘</strong>
           <small>点击窗口 X 时隐藏窗口，真正退出请使用托盘菜单。</small>
         </span>
         <input
@@ -524,18 +579,18 @@ function SettingsPanel({
 }
 
 const USAGE_RANGES: Array<{ value: UsageRange; label: string }> = [
-  { value: "7d", label: "7D" },
-  { value: "15d", label: "15D" },
-  { value: "30d", label: "30D" },
-  { value: "90d", label: "90D" },
-  { value: "all", label: "ALL" },
+  { value: "7d", label: "近 7 天" },
+  { value: "15d", label: "近 15 天" },
+  { value: "30d", label: "近 30 天" },
+  { value: "90d", label: "近 90 天" },
+  { value: "all", label: "全部" },
 ];
 
 const USAGE_BREAKDOWNS: Array<{ value: UsageBreakdown; label: string }> = [
-  { value: "model", label: "Model" },
-  { value: "reasoning", label: "Reasoning" },
-  { value: "speed", label: "Speed" },
-  { value: "tokenType", label: "Token type" },
+  { value: "model", label: "模型" },
+  { value: "reasoning", label: "推理强度" },
+  { value: "speed", label: "速度" },
+  { value: "tokenType", label: "Token 类型" },
 ];
 
 const ANALYTICS_COLORS = ["#007aff", "#5ac8fa", "#34c759", "#ff9f0a", "#af52de", "#ff375f", "#8e8e93"];
@@ -573,11 +628,11 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
     <section className="chart-card analytics-card">
       <div className="row analytics-heading">
         <div>
-          <div className="eyebrow">Experimental Local Analysis</div>
+          <div className="eyebrow">实验性本地分析</div>
           <h2>本地 Codex 使用分析（实验性）</h2>
         </div>
         <div className="muted tiny">
-          {loading ? "分析中…" : `${analytics?.turnCount ?? 0} 个 Turn`}
+          {loading ? "分析中…" : `${analytics?.turnCount ?? 0} 个轮次`}
         </div>
       </div>
 
@@ -594,7 +649,7 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
           ))}
         </div>
         <label className="breakdown-select">
-          <span className="muted tiny">Breakdown by</span>
+          <span className="muted tiny">分类维度</span>
           <select value={breakdown} onChange={(event) => setBreakdown(event.target.value as UsageBreakdown)}>
             {USAGE_BREAKDOWNS.map((item) => (
               <option key={item.value} value={item.value}>{item.label}</option>
@@ -606,8 +661,8 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
       {analytics?.estimatedRemainingTokens != null ? (
         <div className="estimate-card">
           <div>
-            <div className="eyebrow">Estimated Remaining</div>
-            <strong>≈ {formatNumber(analytics.estimatedRemainingTokens)} tokens</strong>
+            <div className="eyebrow">预估剩余</div>
+            <strong>≈ {formatNumber(analytics.estimatedRemainingTokens)} Token</strong>
           </div>
           <span className="muted tiny">
             根据最近 {analytics.estimateSampleCount} 个有效额度区间估算
@@ -617,15 +672,15 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
 
       {!analytics?.points.length ? (
         <p className="muted small analytics-empty">
-          暂无 SQLite 分析数据。首次采集后会保留官方每日总量、本机 Turn 明细和无法归因的用量。
+          暂无 SQLite 分析数据。首次采集后会保留官方每日总量、本机轮次明细和无法归因的用量。
         </p>
       ) : (
         <>
-          <div className="stacked-chart" aria-label="Token activity stacked bar chart">
+          <div className="stacked-chart" aria-label="Token 活动堆叠柱状图">
             {analytics.points.map((point) => {
               const values = Object.entries(point.categoryValues);
               return (
-                <div className="stacked-chart-col" key={point.date} title={`${point.date} · ${formatNumber(point.officialTokens ?? point.localTokens)} token`}>
+                <div className="stacked-chart-col" key={point.date} title={`${point.date} · ${formatNumber(point.officialTokens ?? point.localTokens)} Token`}>
                   <div className="stacked-chart-value">{formatNumber(point.officialTokens ?? point.localTokens)}</div>
                   <div className="stacked-chart-track">
                     {values.map(([category, value], index) => (
@@ -636,7 +691,7 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
                           height: `${Math.max(1, (value / maxValue) * 100)}%`,
                           background: ANALYTICS_COLORS[index % ANALYTICS_COLORS.length],
                         }}
-                        title={`${category}: ${formatNumber(value)}`}
+                        title={`${category}：${formatNumber(value)} Token`}
                       />
                     ))}
                   </div>
@@ -654,7 +709,7 @@ function UsageAnalyticsPanel({ reloadToken }: { reloadToken: number }) {
             ))}
           </div>
           <div className="analytics-footnote muted tiny">
-            此旧版分析仅用于本地 Token 活动与实验性 derived estimate，不进入上方官方额度或模型 Credits 卡片。官方账号总量与本机 rollout 观测保持分开；分类周额度不会在这里推算。
+            此旧版分析仅用于本地 Token 活动与实验性派生预估，不进入上方官方额度或模型额度积分卡片。官方账号总量与本机运行记录观测保持分开；分类周额度不会在这里推算。
           </div>
         </>
       )}
@@ -1763,10 +1818,10 @@ function App() {
                 (snapshot.rateLimits?.rateLimitResetCredits?.availableCount ?? 0) > 0
                   ? (
                     <section className="credit-card">
-                      <div className="eyebrow">Earned reset credits</div>
+                      <div className="eyebrow">已获得的重置额度</div>
                       <div className="row">
                         <h2>
-                          {snapshot.rateLimits?.rateLimitResetCredits?.availableCount} reset available
+                          {snapshot.rateLimits?.rateLimitResetCredits?.availableCount} 个重置额度可用
                         </h2>
                         <span className="muted small">V2 操作功能</span>
                       </div>

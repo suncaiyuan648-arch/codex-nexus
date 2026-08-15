@@ -246,19 +246,19 @@ fn extract_windows(snapshot: &Value) -> Vec<QuotaWindow> {
 
 fn window_label(window: &QuotaWindow) -> String {
     match window.window_duration_mins {
-        300 => "5 Hour".into(),
-        1440 => "Daily".into(),
-        10080 => "Weekly".into(),
-        value if value % 10080 == 0 => format!("{} Week", value / 10080),
-        value if value % 1440 == 0 => format!("{} Day", value / 1440),
-        value if value % 60 == 0 => format!("{} Hour", value / 60),
-        value => format!("{} Minute", value),
+        300 => "5 小时".into(),
+        1440 => "每日".into(),
+        10080 => "每周".into(),
+        value if value % 10080 == 0 => format!("{} 周", value / 10080),
+        value if value % 1440 == 0 => format!("{} 天", value / 1440),
+        value if value % 60 == 0 => format!("{} 小时", value / 60),
+        value => format!("{} 分钟", value),
     }
 }
 
 fn reset_relative(resets_at: Option<i64>) -> String {
     let Some(resets_at) = resets_at else {
-        return "Reset time unavailable.".into();
+        return "重置时间不可用".into();
     };
 
     let total_minutes = (resets_at - now_seconds()).max(0) / 60;
@@ -267,12 +267,12 @@ fn reset_relative(resets_at: Option<i64>) -> String {
     let minutes = total_minutes % 60;
 
     if days > 0 {
-        return format!("Resets in {}d {}h.", days, hours);
+        return format!("将在 {} 天 {} 小时后重置", days, hours);
     }
     if hours > 0 {
-        return format!("Resets in {}h {}m.", hours, minutes);
+        return format!("将在 {} 小时 {} 分钟后重置", hours, minutes);
     }
-    format!("Resets in {}m.", minutes)
+    format!("将在 {} 分钟后重置", minutes)
 }
 
 fn next_threshold(last_notified: u8, used_percent: f64, thresholds: &[u8]) -> Option<u8> {
@@ -324,8 +324,8 @@ pub fn process_snapshot(app: &AppHandle<Wry>, snapshot: &Value) {
 
             if settings.notify_quota_reset {
                 notifications.push((
-                    "Codex quota reset".into(),
-                    format!("Your {} quota is available again.", window_label(window)),
+                    "Codex 额度已重置".into(),
+                    format!("你的{}额度已恢复可用。", window_label(window)),
                 ));
             }
         }
@@ -352,9 +352,9 @@ pub fn process_snapshot(app: &AppHandle<Wry>, snapshot: &Value) {
             should_force_history = true;
 
             notifications.push((
-                format!("Codex usage reached {}%", threshold),
+                format!("Codex 额度已使用 {}%", threshold),
                 format!(
-                    "{} quota has {}% remaining.\n{}",
+                    "{}额度还剩 {}%。\n{}",
                     window_label(window),
                     (100.0 - window.used_percent).round() as i64,
                     reset_relative(window.resets_at),

@@ -158,6 +158,7 @@ export interface UsageMetric {
   status: UsageDataStatus;
   value: number | null;
   sampleCount: number;
+  changeCount: number;
   confidence: UsageConfidence;
   source: string;
 }

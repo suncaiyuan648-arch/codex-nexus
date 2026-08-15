@@ -516,16 +516,21 @@ fn record_rate_limit_samples(
                     "SELECT EXISTS(
                    SELECT 1 FROM rate_limit_samples
                    WHERE account_key = ?1 AND limit_id = ?2 AND window = ?3
-                     AND sampled_at >= ?4 AND used_percent = ?5
-                     AND (resets_at IS ?6 OR resets_at = ?6)
+                     AND window_duration_mins = ?4 AND sampled_at >= ?5
+                     AND used_percent = ?6
+                     AND ((?7 IS NULL AND resets_at IS NULL)
+                          OR (?7 IS NOT NULL AND resets_at IS NOT NULL
+                              AND ABS(resets_at - ?7) <= ?8))
                  )",
                     params![
                         account_key,
                         limit_id,
                         window_name,
+                        duration,
                         sampled_at - 30,
                         used_percent,
-                        resets_at
+                        resets_at,
+                        quota::RESET_AT_TOLERANCE_SECS,
                     ],
                     |row| row.get(0),
                 )
@@ -616,6 +621,38 @@ mod tests {
         });
         record_rate_limit_samples(&connection, "a", 100, &snapshot).unwrap();
         record_rate_limit_samples(&connection, "a", 101, &snapshot).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM rate_limit_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn resets_at_jitter_within_tolerance_is_deduplicated() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let first = json!({
+            "rateLimits": {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": { "windowDurationMins": 10080, "usedPercent": 10.0, "resetsAt": 99 }
+                    }
+                }
+            }
+        });
+        let jittered = json!({
+            "rateLimits": {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": { "windowDurationMins": 10080, "usedPercent": 10.0, "resetsAt": 104 }
+                    }
+                }
+            }
+        });
+        record_rate_limit_samples(&connection, "a", 100, &first).unwrap();
+        record_rate_limit_samples(&connection, "a", 101, &jittered).unwrap();
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM rate_limit_samples", [], |row| {
                 row.get(0)
