@@ -148,6 +148,23 @@ export interface UsageSchedulerStatus {
   fallbackSeconds: number;
   lastRefreshAt: number | null;
   lastLocalActivityAt: number | null;
+  refreshing: boolean;
+  refreshReason: string | null;
+  refreshStartedAt: number | null;
+  refreshGeneration: number | null;
+  queuedRefresh: boolean;
+}
+
+export interface UsageRefreshCompletedPayload {
+  refreshGeneration: number;
+  reason: string;
+  success: boolean;
+  error: string | null;
+}
+
+export interface UsageDataInvalidatedPayload {
+  reason: string;
+  invalidatedAt: number;
 }
 
 export type CategoryUsagePeriod = "day" | "quota_week";

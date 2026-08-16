@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -22,6 +23,8 @@ import type {
   DailyUsageBucket,
   MonitorSettings,
   RateLimitsUpdatedPayload,
+  UsageDataInvalidatedPayload,
+  UsageRefreshCompletedPayload,
   UsageAnalytics,
   UsageBreakdown,
   UsageRange,
@@ -363,30 +366,44 @@ function HomeUsageBreakdown({
   const [todayUsage, setTodayUsage] = useState<CategoryUsage | null>(null);
   const [weeklyUsage, setWeeklyUsage] = useState<CategoryUsage | null>(null);
   const [loading, setLoading] = useState(false);
+  const loadState = useRef({ running: false, dirty: false, mounted: true });
 
-  useEffect(() => {
-    let disposed = false;
-    setLoading(true);
-    void Promise.all([
-      invoke<CategoryUsage>("get_category_usage", { period: "day" }),
-      invoke<CategoryUsage>("get_category_usage", { period: "quota_week" }),
-    ])
-      .then(([today, weekly]) => {
-        if (!disposed) {
+  const loadUsage = useCallback(async () => {
+    loadState.current.dirty = true;
+    if (loadState.current.running) {
+      return;
+    }
+    loadState.current.running = true;
+    while (loadState.current.dirty && loadState.current.mounted) {
+      loadState.current.dirty = false;
+      setLoading(true);
+      try {
+        const [today, weekly] = await Promise.all([
+          invoke<CategoryUsage>("get_category_usage", { period: "day" }),
+          invoke<CategoryUsage>("get_category_usage", { period: "quota_week" }),
+        ]);
+        if (loadState.current.mounted) {
           setTodayUsage(today);
           setWeeklyUsage(weekly);
         }
-      })
-      .catch((error) => console.error("[UI] homepage usage load failed:", error))
-      .finally(() => {
-        if (!disposed) {
+      } catch (error) {
+        console.error("[UI] homepage usage load failed:", error);
+      } finally {
+        if (loadState.current.mounted) {
           setLoading(false);
         }
-      });
+      }
+    }
+    loadState.current.running = false;
+  }, []);
+
+  useEffect(() => {
+    loadState.current.mounted = true;
+    void loadUsage();
     return () => {
-      disposed = true;
+      loadState.current.mounted = false;
     };
-  }, [reloadToken]);
+  }, [loadUsage, reloadToken]);
 
   return (
     <div className="quota-grid weekly-quota-row">
@@ -451,7 +468,11 @@ function SettingsPanel({
           {saving
             ? "保存中…"
             : schedulerStatus
-              ? `${schedulerStatus.watcherActive ? "实时监听" : "周期校准"} · ${refreshPolicyLabel(schedulerStatus.policy)}`
+              ? schedulerStatus.refreshing
+                ? `刷新中 · 第 ${schedulerStatus.refreshGeneration ?? "—"} 代`
+                : schedulerStatus.queuedRefresh
+                  ? "刷新已排队"
+                  : `${schedulerStatus.watcherActive ? "实时监听" : "周期校准"} · ${refreshPolicyLabel(schedulerStatus.policy)}`
               : "已保存到本机"}
         </div>
       </div>
@@ -905,6 +926,11 @@ function App() {
     setLoading,
   ] = useState(true);
 
+  const [refreshing, setRefreshing] = useState(false);
+  const pendingRefreshGeneration = useRef<number | null>(null);
+  const lastCompletedRefreshGeneration = useRef(0);
+  const usageInvalidationTimer = useRef<number | null>(null);
+
   const [
     error,
     setError,
@@ -929,8 +955,130 @@ function App() {
     setAnalyticsReloadToken,
   ] = useState(0);
 
+  const scheduleUsageDataReload = useCallback(() => {
+    if (usageInvalidationTimer.current !== null) {
+      return;
+    }
+    usageInvalidationTimer.current = window.setTimeout(() => {
+      usageInvalidationTimer.current = null;
+      setAnalyticsReloadToken((value) => value + 1);
+    }, 300);
+  }, []);
+
+  useEffect(() => () => {
+    if (usageInvalidationTimer.current !== null) {
+      window.clearTimeout(usageInvalidationTimer.current);
+      usageInvalidationTimer.current = null;
+    }
+  }, []);
+
   const [schedulerStatus, setSchedulerStatus] =
     useState<UsageSchedulerStatus | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    const setup = async () => {
+      unlisten = await listen<UsageRefreshCompletedPayload>(
+        "codex://usage-refresh-completed",
+        (event) => {
+          const payload = event.payload;
+          lastCompletedRefreshGeneration.current = Math.max(
+            lastCompletedRefreshGeneration.current,
+            payload.refreshGeneration,
+          );
+          if (disposed || pendingRefreshGeneration.current !== payload.refreshGeneration) {
+            return;
+          }
+          pendingRefreshGeneration.current = null;
+          setRefreshing(false);
+          if (!payload.success && payload.error) {
+            setError(payload.error);
+          }
+        },
+      );
+    };
+
+    void setup().catch((setupError) => {
+      if (!disposed) {
+        console.error("[UI] refresh completion listener failed:", setupError);
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    const setup = async () => {
+      unlisten = await listen<UsageDataInvalidatedPayload>(
+        "codex://usage-data-invalidated",
+        () => {
+          if (!disposed) {
+            scheduleUsageDataReload();
+          }
+        },
+      );
+    };
+
+    void setup().catch((setupError) => {
+      if (!disposed) {
+        console.error("[UI] usage invalidation listener failed:", setupError);
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [scheduleUsageDataReload]);
+
+  useEffect(() => {
+    let currentDayKey = toLocalDateKey(new Date());
+    let rolloverTimer: number | null = null;
+
+    const checkLocalDay = () => {
+      const nextDayKey = toLocalDateKey(new Date());
+      if (nextDayKey === currentDayKey) {
+        return;
+      }
+      currentDayKey = nextDayKey;
+      scheduleUsageDataReload();
+      void invoke<number>("refresh_usage_now").catch((refreshError) => {
+        console.error("[UI] local-day refresh request failed:", refreshError);
+      });
+    };
+
+    const scheduleNextMidnight = () => {
+      const now = new Date();
+      const next = new Date(now);
+      next.setHours(24, 0, 1, 0);
+      rolloverTimer = window.setTimeout(() => {
+        checkLocalDay();
+        scheduleNextMidnight();
+      }, Math.max(1000, next.getTime() - now.getTime()));
+    };
+
+    const interval = window.setInterval(checkLocalDay, 30_000);
+    document.addEventListener("visibilitychange", checkLocalDay);
+    window.addEventListener("focus", checkLocalDay);
+    scheduleNextMidnight();
+
+    return () => {
+      window.clearInterval(interval);
+      if (rolloverTimer !== null) {
+        window.clearTimeout(rolloverTimer);
+      }
+      document.removeEventListener("visibilitychange", checkLocalDay);
+      window.removeEventListener("focus", checkLocalDay);
+    };
+  }, [scheduleUsageDataReload]);
 
   const [
     settingsOpen,
@@ -978,10 +1126,15 @@ function App() {
     useCallback(
       async () => {
         try {
-          setLoading(true);
+          setRefreshing(true);
           setError(null);
 
-          await invoke<void>("refresh_usage_now");
+          const generation = await invoke<number>("refresh_usage_now");
+          pendingRefreshGeneration.current = generation;
+          if (lastCompletedRefreshGeneration.current >= generation) {
+            pendingRefreshGeneration.current = null;
+            setRefreshing(false);
+          }
         } catch (error) {
           console.error(
             "[UI] snapshot refresh failed:",
@@ -991,8 +1144,7 @@ function App() {
           setError(
             String(error),
           );
-        } finally {
-          setLoading(false);
+          setRefreshing(false);
         }
       },
       [],
@@ -1608,9 +1760,9 @@ function App() {
             className="refresh"
             onClick={() => void refresh()}
             /* 连接没 Ready 时不能 Refresh。 */
-            disabled={loading || !connectionReady}
+            disabled={refreshing || !connectionReady}
           >
-            {loading ? "加载中…" : "刷新"}
+            {refreshing ? "刷新中…" : "刷新"}
           </button>
         </div>
       </header>

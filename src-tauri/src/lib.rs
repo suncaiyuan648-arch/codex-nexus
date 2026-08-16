@@ -121,8 +121,8 @@ fn get_cached_codex_snapshot(state: State<'_, usage::UsageSchedulerState>) -> Op
 }
 
 #[tauri::command]
-fn refresh_usage_now(state: State<'_, usage::UsageSchedulerState>) -> Result<(), String> {
-    state.scheduler.refresh_now_blocking()
+fn refresh_usage_now(state: State<'_, usage::UsageSchedulerState>) -> Result<u64, String> {
+    state.scheduler.request_refresh()
 }
 
 #[tauri::command]

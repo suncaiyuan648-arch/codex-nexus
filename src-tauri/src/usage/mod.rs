@@ -1,3 +1,6 @@
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Wry};
+
 pub mod analytics;
 pub mod category_usage;
 pub mod db;
@@ -12,6 +15,27 @@ pub mod scheduler;
 pub use models::{AccountScope, CategoryUsage, UsageAnalytics, UsageAnalyticsQuery};
 pub use scheduler::{UsageRefreshScheduler, UsageSchedulerState, UsageSchedulerStatus};
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDataInvalidatedPayload {
+    pub reason: String,
+    pub invalidated_at: i64,
+}
+
+pub fn emit_usage_data_invalidated(app: &AppHandle<Wry>, reason: &str) {
+    let invalidated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    let _ = app.emit(
+        "codex://usage-data-invalidated",
+        UsageDataInvalidatedPayload {
+            reason: reason.into(),
+            invalidated_at,
+        },
+    );
+}
+
 pub fn record_official_snapshot(
     app: &tauri::AppHandle<tauri::Wry>,
     snapshot: &serde_json::Value,
@@ -23,7 +47,11 @@ pub fn record_rate_limit_update(
     app: &tauri::AppHandle<tauri::Wry>,
     payload: &serde_json::Value,
 ) -> Result<(), String> {
-    recorder::record_rate_limit_update(app, payload)
+    let result = recorder::record_rate_limit_update(app, payload);
+    if result.is_ok() {
+        emit_usage_data_invalidated(app, "rate_limits");
+    }
+    result
 }
 
 pub fn analytics(
