@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 
-use super::models::Confidence;
+use super::models::{is_unresolved_account_key, Confidence};
 
 /// `resetsAt` is an epoch-second value, but the server can move it by a few
 /// seconds between otherwise identical rate-limit snapshots. Treat that
@@ -44,6 +44,9 @@ pub fn refresh_intervals(
     limit_id: &str,
     window: &str,
 ) -> Result<(), String> {
+    if is_unresolved_account_key(account_key) {
+        return Ok(());
+    }
     let mut statement = connection
         .prepare(
             "SELECT id, sampled_at, window_duration_mins, used_percent, resets_at
@@ -197,6 +200,11 @@ pub fn rebuild_all_intervals(connection: &Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let buckets = rows
         .map(|row| row.map_err(|error| error.to_string()))
+        .filter(|row| {
+            row.as_ref()
+                .map(|(account_key, _, _)| !is_unresolved_account_key(account_key))
+                .unwrap_or(true)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     for (account_key, limit_id, window) in buckets {
         refresh_intervals(connection, &account_key, &limit_id, &window)?;
@@ -207,6 +215,9 @@ pub fn rebuild_all_intervals(connection: &Connection) -> Result<(), String> {
 /// Rebuild derived quota steps for one account. Account-scoped rollout
 /// migrations must not mutate another account's derived attribution.
 pub fn rebuild_account_intervals(connection: &Connection, account_key: &str) -> Result<(), String> {
+    if is_unresolved_account_key(account_key) {
+        return Ok(());
+    }
     let mut statement = connection
         .prepare(
             "SELECT DISTINCT limit_id, window

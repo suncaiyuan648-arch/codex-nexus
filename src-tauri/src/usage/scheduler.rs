@@ -126,6 +126,7 @@ pub struct UsageRefreshScheduler {
     latest_snapshot: Arc<Mutex<Option<Value>>>,
     status: Arc<Mutex<UsageSchedulerStatus>>,
     refresh_queue: Arc<Mutex<RefreshQueue>>,
+    _collector_session: Option<super::collector_core::CollectorSessionGuard>,
 }
 
 pub struct UsageSchedulerState {
@@ -171,15 +172,31 @@ impl UsageRefreshScheduler {
             refresh_generation: None,
             queued_refresh: false,
         }));
+        let collector_session = match super::collector_core::start_for_app(&app) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                eprintln!("[Usage] collector session unavailable: {error}");
+                None
+            }
+        };
+        let collector_identity = collector_session
+            .as_ref()
+            .map(|session| (session.session_id.clone(), session.instance_id.clone()));
+        let collector_enabled = collector_identity.is_some();
         let scheduler = Arc::new(Self {
             sender: sender.clone(),
             latest_snapshot: Arc::clone(&latest_snapshot),
             status: Arc::clone(&status),
             refresh_queue: Arc::clone(&refresh_queue),
+            _collector_session: collector_session,
         });
 
         install_app_event_bridges(&app, &sender, Arc::clone(&refresh_queue));
-        let watcher_active = install_rollout_watcher(sender.clone());
+        let watcher_active = if collector_enabled {
+            install_rollout_watcher(sender.clone())
+        } else {
+            false
+        };
         if let Ok(mut current) = status.lock() {
             current.watcher_active = watcher_active;
         }
@@ -204,6 +221,8 @@ impl UsageRefreshScheduler {
                     thread_usage_in_flight,
                     thread_sender,
                     watcher_active,
+                    collector_identity,
+                    collector_enabled,
                 );
             })
             .expect("failed to start UsageRefreshScheduler");
@@ -428,8 +447,13 @@ fn run_scheduler(
     thread_usage_in_flight: Arc<AtomicBool>,
     sender: mpsc::Sender<SchedulerCommand>,
     watcher_active: bool,
+    collector_identity: Option<(String, String)>,
+    collector_enabled: bool,
 ) {
-    let _ = rollout::collect_rollouts(&app);
+    heartbeat_collector(&app, collector_identity.as_ref());
+    if collector_enabled {
+        let _ = rollout::collect_rollouts(&app);
+    }
     let mut next_fallback = Instant::now() + policy.fallback_duration(is_foreground(&app), false);
     let mut next_thread_usage: Option<Instant> = None;
     let mut debounce_deadline: Option<Instant> = None;
@@ -440,6 +464,7 @@ fn run_scheduler(
     let mut next_day_boundary_at = next_local_day_boundary();
 
     loop {
+        heartbeat_collector(&app, collector_identity.as_ref());
         let foreground = is_foreground(&app);
         let recently_active = last_local_activity
             .map(|instant| instant.elapsed() < LONG_IDLE_AFTER)
@@ -490,8 +515,13 @@ fn run_scheduler(
                         last_local_activity_at,
                         &refresh_queue,
                     );
-                    let result =
-                        perform_fast_refresh(&app, &client, &latest_snapshot, &mut last_refresh_at);
+                    let result = perform_fast_refresh(
+                        &app,
+                        &client,
+                        &latest_snapshot,
+                        &mut last_refresh_at,
+                        collector_identity.as_ref(),
+                    );
                     let success = result.is_ok();
                     if let Err(error) = &result {
                         eprintln!("[Usage] {} refresh failed: {error}", request.reason);
@@ -515,7 +545,7 @@ fn run_scheduler(
                 // The notification path has already persisted the sample.
                 // It also gives the short-lived settlement loop a chance to
                 // stop early when the server has settled the Turn.
-                match refresh_rollout_ledger(&app) {
+                match refresh_rollout_ledger(&app, collector_identity.as_ref()) {
                     Ok(true) => usage::emit_usage_data_invalidated(&app, "local_rollout"),
                     Ok(false) => {}
                     Err(error) => {
@@ -533,7 +563,11 @@ fn run_scheduler(
             }
             Ok(SchedulerCommand::LocalFileChanged(path)) => {
                 if !path.as_os_str().is_empty() {
-                    match rollout::collect_rollout_file(&app, &path) {
+                    match if collector_enabled {
+                        rollout::collect_rollout_file(&app, &path)
+                    } else {
+                        Ok(false)
+                    } {
                         Ok(true) => {
                             usage::emit_usage_data_invalidated(&app, "local_rollout");
                             last_local_activity = Some(Instant::now());
@@ -567,6 +601,7 @@ fn run_scheduler(
                         &client,
                         &latest_snapshot,
                         &mut last_refresh_at,
+                        collector_identity.as_ref(),
                     ) {
                         eprintln!("[Usage] scheduler reconciliation failed: {error}");
                     }
@@ -582,6 +617,7 @@ fn run_scheduler(
                         &client,
                         &latest_snapshot,
                         &mut last_refresh_at,
+                        collector_identity.as_ref(),
                     ) {
                         eprintln!("[Usage] settlement reconciliation failed: {error}");
                     }
@@ -605,6 +641,20 @@ fn run_scheduler(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+fn heartbeat_collector(app: &AppHandle<Wry>, identity: Option<&(String, String)>) {
+    let Some((session_id, instance_id)) = identity else {
+        return;
+    };
+    if let Ok(connection) = db::open_database_for_collector(app) {
+        let _ = super::collector_core::touch_session(
+            &connection,
+            session_id,
+            now_seconds(),
+            instance_id,
+        );
     }
 }
 
@@ -761,12 +811,19 @@ fn perform_fast_refresh(
     client: &Arc<CodexRpcClient>,
     latest_snapshot: &Arc<Mutex<Option<Value>>>,
     last_refresh_at: &mut Option<i64>,
+    collector_identity: Option<&(String, String)>,
 ) -> Result<(), String> {
     if client.status().phase != "ready" {
         return Ok(());
     }
     let snapshot = crate::fetch_codex_snapshot(client)?;
-    apply_snapshot(app, snapshot, latest_snapshot, last_refresh_at)
+    apply_snapshot(
+        app,
+        snapshot,
+        latest_snapshot,
+        last_refresh_at,
+        collector_identity,
+    )
 }
 
 fn perform_day_boundary_sampling(
@@ -812,6 +869,7 @@ fn perform_reconciliation(
     client: &Arc<CodexRpcClient>,
     latest_snapshot: &Arc<Mutex<Option<Value>>>,
     last_refresh_at: &mut Option<i64>,
+    collector_identity: Option<&(String, String)>,
 ) -> Result<(), String> {
     if client.status().phase != "ready" {
         return Ok(());
@@ -837,7 +895,13 @@ fn perform_reconciliation(
         object.insert("usage".into(), usage);
         object.insert("rateLimits".into(), rate_limits);
     }
-    apply_snapshot(app, snapshot, latest_snapshot, last_refresh_at)
+    apply_snapshot(
+        app,
+        snapshot,
+        latest_snapshot,
+        last_refresh_at,
+        collector_identity,
+    )
 }
 
 fn apply_snapshot(
@@ -845,11 +909,12 @@ fn apply_snapshot(
     snapshot: Value,
     latest_snapshot: &Arc<Mutex<Option<Value>>>,
     last_refresh_at: &mut Option<i64>,
+    collector_identity: Option<&(String, String)>,
 ) -> Result<(), String> {
     if let Err(error) = recorder::record_official_snapshot(app, &snapshot) {
         eprintln!("[Usage] scheduler failed to record snapshot: {error}");
     }
-    match refresh_rollout_ledger(app) {
+    match refresh_rollout_ledger(app, collector_identity) {
         Ok(true) => usage::emit_usage_data_invalidated(app, "local_rollout"),
         Ok(false) => {}
         Err(error) => eprintln!("[Usage] snapshot rollout recovery failed: {error}"),
@@ -864,9 +929,16 @@ fn apply_snapshot(
     Ok(())
 }
 
-fn refresh_rollout_ledger(app: &AppHandle<Wry>) -> Result<bool, String> {
+fn refresh_rollout_ledger(
+    app: &AppHandle<Wry>,
+    collector_identity: Option<&(String, String)>,
+) -> Result<bool, String> {
+    let Some((session_id, instance_id)) = collector_identity else {
+        return Ok(false);
+    };
     let changed = rollout::collect_rollouts(app)?;
-    let connection = db::open_database(app)?;
+    let connection = db::open_database_for_collector(app)?;
+    super::collector_core::touch_session(&connection, session_id, now_seconds(), instance_id)?;
     if let Some(account_key) = recorder::current_account_key(&connection)? {
         rollout::refresh_account_data_health(&connection, &account_key)?;
     }

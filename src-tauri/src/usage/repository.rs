@@ -145,13 +145,50 @@ fn date_for(timestamp: i64, offset: FixedOffset) -> String {
 
 fn scope_keys(connection: &Connection, scope: &AccountScope) -> Result<Vec<String>, String> {
     match scope {
-        AccountScope::Single { account_key } => Ok(vec![account_key.clone()]),
+        AccountScope::Single { account_key } if is_unresolved_account_key(account_key) => {
+            Ok(Vec::new())
+        }
+        AccountScope::Single { account_key } => {
+            let legacy: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM account_usage_data_versions
+                       WHERE account_key = ?1 AND status = 'legacy_unverified'
+                     )",
+                    [account_key],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if legacy {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![account_key.clone()])
+            }
+        }
         AccountScope::All => {
             let mut statement = connection
                 .prepare(
                     "SELECT account_key FROM accounts
+                     WHERE account_key NOT LIKE 'unresolved:%'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM account_usage_data_versions h
+                         WHERE h.account_key = accounts.account_key
+                           AND h.status = 'legacy_unverified'
+                       )
                  UNION SELECT account_key FROM turn_usage
+                     WHERE account_key NOT LIKE 'unresolved:%'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM account_usage_data_versions h
+                         WHERE h.account_key = turn_usage.account_key
+                           AND h.status = 'legacy_unverified'
+                       )
                  UNION SELECT account_key FROM account_daily_usage
+                     WHERE account_key NOT LIKE 'unresolved:%'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM account_usage_data_versions h
+                         WHERE h.account_key = account_daily_usage.account_key
+                           AND h.status = 'legacy_unverified'
+                       )
                  ORDER BY account_key",
                 )
                 .map_err(|error| error.to_string())?;

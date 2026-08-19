@@ -11,6 +11,10 @@ pub const USAGE_STATUS_OBSERVED: &str = "observed";
 pub const USAGE_STATUS_ESTIMATED: &str = "estimated";
 pub const USAGE_STATUS_INSUFFICIENT_DATA: &str = "insufficient_data";
 
+pub fn is_unresolved_account_key(account_key: &str) -> bool {
+    account_key.starts_with("unresolved:")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Confidence {

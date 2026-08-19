@@ -4,7 +4,7 @@
 
 | 任务 | Coder | Reviewer 轮次 | 状态 | 结果 |
 | --- | --- | --- | --- | --- |
-| Task A — Durable data plane / Collector core | 待唤起 | 待唤起 | 待开始 | — |
+| Task A — Durable data plane / Collector core | Banach（Coder A） | Helmholtz / Darwin / Mencius / Epicurus / Archimedes / Tesla / Ohm（A1–A7） | 已通过 | A1–A6 提出问题并回传修复；A7 PASS。Rust 78 tests、前端 build、diff check 通过 |
 | Task B — IPC / UI health / gap-aware integration | 待唤起 | 待唤起 | 待开始 | 依赖 Task A 通过 |
 
 ## Review 规则
@@ -13,3 +13,7 @@
 2. 不通过时，将 reviewer 的具体 findings 原样归纳后发回原 coder 修复。
 3. 每次修复完成后唤起新的 reviewer；不得复用之前的 reviewer。
 4. Task B 只有在 Task A 的 reviewer 明确通过后才能启动。
+
+## Task A 结果摘要
+
+Task A 已完成并通过 A7 终审。实现包含 durable `rollout_sources` cursor/binding/generation、ownership timeline、collector session/gap、OS singleton lock、writer token、replacement fingerprint、transactional reset/retroactive binding、legacy migration/backfill 与 unresolved 隔离。Task B 的独立 binary/IPC、UI health、gap-aware estimator 和 OS lifecycle 仍待实施。

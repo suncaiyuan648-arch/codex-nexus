@@ -3,6 +3,7 @@ use tauri::{AppHandle, Emitter, Wry};
 
 pub mod analytics;
 pub mod category_usage;
+pub mod collector_core;
 pub mod db;
 pub mod models;
 pub mod quota;

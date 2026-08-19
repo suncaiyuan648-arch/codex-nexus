@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::models::{AccountDataHealth, Confidence, TokenUsage, TurnUsageRecord, SOURCE_ROLLOUT};
-use super::{db, rate_card::RateCard, recorder};
+use super::{collector_core::BINDING_VERIFIED, db, rate_card::RateCard, recorder};
 
 pub const ROLLOUT_PARSER_VERSION: i64 = 9;
 pub const DATA_HEALTH_VERIFIED: &str = "verified";
@@ -210,13 +210,14 @@ fn insert_token_sample(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn process_line(
     connection: &Connection,
     line: &str,
     state: &mut CursorState,
     account_key: &str,
 ) -> Result<bool, String> {
-    process_line_inner(connection, line, state, account_key, true)
+    process_line_inner(connection, line, state, account_key, true, None)
 }
 
 fn process_line_inner(
@@ -225,6 +226,7 @@ fn process_line_inner(
     state: &mut CursorState,
     account_key: &str,
     persist: bool,
+    source_id: Option<&str>,
 ) -> Result<bool, String> {
     let value: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
     let timestamp = parse_timestamp(value.get("timestamp")).unwrap_or_else(recorder::now_seconds);
@@ -362,14 +364,50 @@ fn process_line_inner(
                         &sample_confidence,
                     )?;
                 }
+                if let Some(source_id) = source_id {
+                    connection
+                        .execute(
+                            "INSERT OR IGNORE INTO rollout_turn_sources
+                             (source_id, account_key, thread_id, turn_id, first_seen_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![
+                                source_id,
+                                account_key,
+                                turn.thread_id,
+                                turn.turn_id,
+                                timestamp
+                            ],
+                        )
+                        .map_err(|error| error.to_string())?;
+                }
             }
-            Ok(true)
+            Ok(delta_usage.raw_total_tokens > 0)
         }
         _ => Ok(false),
     }
 }
 
-fn load_cursor(connection: &Connection, path: &str) -> Result<Option<RolloutCursor>, String> {
+fn load_cursor(
+    connection: &Connection,
+    path: &str,
+    source_id: Option<&str>,
+) -> Result<Option<RolloutCursor>, String> {
+    if let Some(source_id) = source_id {
+        return connection
+            .query_row(
+                "SELECT last_offset, cursor_state_json FROM rollout_sources WHERE source_id = ?1",
+                [source_id],
+                |row| {
+                    let state_json: String = row.get(1)?;
+                    Ok(RolloutCursor {
+                        byte_offset: row.get::<_, i64>(0)?.max(0) as u64,
+                        state: serde_json::from_str(&state_json).unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string());
+    }
     connection
         .query_row(
             "SELECT byte_offset, state_json FROM rollout_cursors WHERE file_path = ?1",
@@ -377,7 +415,7 @@ fn load_cursor(connection: &Connection, path: &str) -> Result<Option<RolloutCurs
             |row| {
                 let state_json: String = row.get(1)?;
                 Ok(RolloutCursor {
-                    byte_offset: row.get::<_, i64>(0)? as u64,
+                    byte_offset: row.get::<_, i64>(0)?.max(0) as u64,
                     state: serde_json::from_str(&state_json).unwrap_or_default(),
                 })
             },
@@ -402,28 +440,106 @@ fn save_cursor(
     byte_offset: u64,
     modified_at: i64,
     state: &CursorState,
+    source_id: Option<&str>,
 ) -> Result<(), String> {
     let state_json = serde_json::to_string(state).map_err(|error| error.to_string())?;
-    connection.execute(
-        "INSERT INTO rollout_cursors (file_path, byte_offset, last_modified_at, last_scanned_at, state_json)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(file_path) DO UPDATE SET byte_offset=excluded.byte_offset,
-           last_modified_at=excluded.last_modified_at, last_scanned_at=excluded.last_scanned_at,
-           state_json=excluded.state_json",
-        params![path, byte_offset as i64, modified_at, recorder::now_seconds(), state_json],
-    ).map_err(|error| error.to_string())?;
+    if let Some(source_id) = source_id {
+        let size = fs::metadata(path).map_err(|error| error.to_string())?.len() as i64;
+        let fingerprint = super::collector_core::file_fingerprint(Path::new(path))?;
+        let prefix_fingerprint =
+            super::collector_core::file_prefix_fingerprint(Path::new(path), byte_offset)?;
+        connection
+            .execute(
+                "UPDATE rollout_sources SET last_offset = ?2, last_size = ?3,
+                 last_mtime = ?4, cursor_state_json = ?5, file_fingerprint = ?6,
+                 cursor_prefix_fingerprint = ?7, parser_version = ?8,
+                 updated_at = ?9 WHERE source_id = ?1",
+                params![
+                    source_id,
+                    byte_offset as i64,
+                    size,
+                    modified_at,
+                    state_json,
+                    fingerprint,
+                    prefix_fingerprint,
+                    ROLLOUT_PARSER_VERSION,
+                    recorder::now_seconds()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    // The legacy cursor is only maintained by the cfg(test) compatibility
+    // parser and one-time historical migration. Durable production callers
+    // always provide source_id and write rollout_sources above.
+    if source_id.is_none() {
+        connection
+            .execute(
+                "INSERT INTO rollout_cursors (file_path, byte_offset, last_modified_at, last_scanned_at, state_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(file_path) DO UPDATE SET byte_offset=excluded.byte_offset,
+                   last_modified_at=excluded.last_modified_at, last_scanned_at=excluded.last_scanned_at,
+                   state_json=excluded.state_json",
+                params![path, byte_offset as i64, modified_at, recorder::now_seconds(), state_json],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
-fn collect_one(
+#[allow(dead_code)]
+#[cfg(test)]
+pub(crate) fn collect_one(
     connection: &Connection,
     path: &Path,
     account_key: &str,
     rebuild_batch_id: &str,
 ) -> Result<bool, String> {
+    collect_one_internal(connection, path, account_key, rebuild_batch_id, None, true)
+}
+
+pub(crate) fn collect_one_for_source(
+    connection: &Connection,
+    path: &Path,
+    account_key: &str,
+    rebuild_batch_id: &str,
+    source_id: Option<&str>,
+) -> Result<bool, String> {
+    collect_one_internal(
+        connection,
+        path,
+        account_key,
+        rebuild_batch_id,
+        source_id,
+        false,
+    )
+}
+
+fn collect_one_for_rebuild(
+    connection: &Connection,
+    path: &Path,
+    account_key: &str,
+    rebuild_batch_id: &str,
+) -> Result<bool, String> {
+    // Historical rebuilds parse into a staging account and must not mutate
+    // either cursor store. Durable production collection uses source_id.
+    collect_one_internal(connection, path, account_key, rebuild_batch_id, None, false)
+}
+
+fn collect_one_internal(
+    connection: &Connection,
+    path: &Path,
+    account_key: &str,
+    rebuild_batch_id: &str,
+    source_id: Option<&str>,
+    persist_legacy_cursor: bool,
+) -> Result<bool, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let path_string = path.to_string_lossy().into_owned();
-    let mut cursor = load_cursor(connection, &path_string)?.unwrap_or_else(fresh_cursor);
+    let mut cursor = if source_id.is_some() || persist_legacy_cursor {
+        load_cursor(connection, &path_string, source_id)?.unwrap_or_else(fresh_cursor)
+    } else {
+        fresh_cursor()
+    };
     if cursor.state.parser_version != ROLLOUT_PARSER_VERSION {
         cursor = fresh_cursor();
     }
@@ -458,11 +574,13 @@ fn collect_one(
             offset = line_start;
             break;
         }
-        match process_line(
+        match process_line_inner(
             &transaction,
             line.trim_end(),
             &mut cursor.state,
             account_key,
+            true,
+            source_id,
         ) {
             Ok(line_changed) => changed |= line_changed,
             Err(error) => {
@@ -472,6 +590,7 @@ fn collect_one(
                     line_start,
                     &error,
                     account_key,
+                    source_id,
                     rebuild_batch_id,
                 )?;
                 eprintln!(
@@ -486,13 +605,16 @@ fn collect_one(
         .ok()
         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|value| value.as_secs() as i64);
-    save_cursor(
-        &transaction,
-        &path_string,
-        offset,
-        modified_at.unwrap_or_else(recorder::now_seconds),
-        &cursor.state,
-    )?;
+    if source_id.is_some() || persist_legacy_cursor {
+        save_cursor(
+            &transaction,
+            &path_string,
+            offset,
+            modified_at.unwrap_or_else(recorder::now_seconds),
+            &cursor.state,
+            source_id,
+        )?;
+    }
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(changed)
 }
@@ -666,13 +788,18 @@ fn file_modified_at(path: &str) -> Option<i64> {
 fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i64, i64), String> {
     let mut statement = connection
         .prepare(
-            "SELECT file_path, status FROM rollout_file_bindings
-             WHERE account_key = ?1 OR (account_key IS NULL AND status = 'pending')",
+            "SELECT canonical_path, binding_status, last_offset
+             FROM rollout_sources
+             WHERE account_key = ?1 OR binding_status = 'unresolved'",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([account_key], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -691,7 +818,7 @@ fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i6
         .optional()
         .map_err(|error| error.to_string())?;
     let mut incomplete_count = 0;
-    for (path, status) in rows {
+    for (path, status, cursor_offset) in rows {
         let Some(metadata) = fs::metadata(&path).ok() else {
             continue;
         };
@@ -710,15 +837,6 @@ fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i6
             continue;
         }
         let file_size = metadata.len();
-        let cursor_offset: i64 = connection
-            .query_row(
-                "SELECT byte_offset FROM rollout_cursors WHERE file_path = ?1",
-                [&path],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .unwrap_or(0);
         if file_size > cursor_offset.max(0) as u64 {
             incomplete_count += 1;
         }
@@ -771,7 +889,7 @@ fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i6
     Ok((incomplete_count, source_lag_seconds))
 }
 
-fn set_account_data_health(
+pub(crate) fn set_account_data_health(
     connection: &Connection,
     account_key: &str,
     requested_status: &str,
@@ -954,7 +1072,7 @@ fn record_timeline_audit(
     Ok(())
 }
 
-fn audit_timeline_gaps(
+pub(crate) fn audit_timeline_gaps(
     connection: &Connection,
     account_key: Option<&str>,
     missing_reason: &str,
@@ -1051,22 +1169,25 @@ fn record_parse_error(
     byte_offset: u64,
     error: &str,
     account_key: &str,
+    source_id: Option<&str>,
     rebuild_batch_id: &str,
 ) -> Result<(), String> {
     connection
         .execute(
             "INSERT INTO rollout_parse_errors
-             (file_path, byte_offset, error, account_key, rebuild_batch_id, first_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             (file_path, byte_offset, error, account_key, source_id, rebuild_batch_id, first_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(file_path, byte_offset) DO UPDATE SET
                error = excluded.error,
                account_key = excluded.account_key,
+               source_id = excluded.source_id,
                rebuild_batch_id = excluded.rebuild_batch_id",
             params![
                 file_path,
                 byte_offset as i64,
                 error,
                 account_key,
+                source_id,
                 rebuild_batch_id,
                 recorder::now_seconds()
             ],
@@ -1163,16 +1284,6 @@ fn clear_rollout_derived_data(connection: &Connection, account_key: &str) -> Res
     transaction.commit().map_err(|error| error.to_string())
 }
 
-fn reset_rollout_cursors(connection: &Connection) -> Result<(), String> {
-    // Cursors have no account column. A scoped rebuild replays into an
-    // isolated staging account, then the cursor can safely continue under
-    // the current account after the atomic swap.
-    connection
-        .execute("DELETE FROM rollout_cursors", [])
-        .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 fn replace_account_from_staging(
     connection: &Connection,
     account_key: &str,
@@ -1248,7 +1359,67 @@ fn clear_staging_health_records(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn quarantine_unverified_account_data(
+#[cfg(test)]
+fn advance_cursor_without_persisting(
+    connection: &Connection,
+    path: &str,
+    account_key: &str,
+) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let mut cursor = load_cursor(connection, path, None)?.unwrap_or_else(fresh_cursor);
+    if metadata.len() < cursor.byte_offset {
+        cursor = fresh_cursor();
+    }
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(cursor.byte_offset))
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut offset = cursor.byte_offset;
+    loop {
+        line.clear();
+        let line_start = offset;
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            break;
+        }
+        offset += bytes as u64;
+        if !line.ends_with('\n') {
+            offset = line_start;
+            break;
+        }
+        if process_line_inner(
+            connection,
+            line.trim_end(),
+            &mut cursor.state,
+            account_key,
+            false,
+            None,
+        )
+        .is_err()
+        {
+            cursor.state = fresh_cursor().state;
+        }
+    }
+    cursor.state.parser_version = ROLLOUT_PARSER_VERSION;
+    save_cursor(
+        connection,
+        path,
+        offset,
+        metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_secs() as i64)
+            .unwrap_or_else(recorder::now_seconds),
+        &cursor.state,
+        None,
+    )
+}
+
+pub(crate) fn quarantine_unverified_account_data(
     connection: &Connection,
     account_key: &str,
 ) -> Result<(), String> {
@@ -1299,16 +1470,60 @@ fn quarantine_unverified_account_data(
             [account_key],
         )
         .map_err(|error| error.to_string())?;
+    for table in [
+        "account_daily_usage",
+        "thread_usage_group_samples",
+        "thread_usage_capabilities",
+        "rate_limit_samples",
+        "account_presence_intervals",
+        "rollout_turn_sources",
+    ] {
+        connection
+            .execute(
+                &format!("DELETE FROM {table} WHERE account_key = ?1"),
+                [account_key],
+            )
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
-fn advance_cursor_without_persisting(
+fn record_historical_reset_quarantine(
     connection: &Connection,
-    path: &str,
+    source_id: &str,
+    old_account_key: Option<&str>,
+    old_status: &str,
+    now: i64,
+) -> Result<(), String> {
+    if old_status == BINDING_VERIFIED {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "INSERT INTO source_binding_audits
+             (source_id, old_account_key, new_account_key, old_status, new_status,
+              reason, evidence, changed_at)
+             SELECT ?1, ?2, NULL, ?3, 'quarantined', 'historical_reset_quarantine',
+                    'legacy/non-verified source was rebased to its durable tail', ?4
+             WHERE NOT EXISTS (
+               SELECT 1 FROM source_binding_audits
+               WHERE source_id = ?1 AND reason = 'historical_reset_quarantine'
+             )",
+            params![source_id, old_account_key, old_status, now],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn advance_source_cursor_without_persisting_in_transaction(
+    connection: &Connection,
+    source_id: &str,
+    path: &Path,
     account_key: &str,
 ) -> Result<(), String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
-    let mut cursor = load_cursor(connection, path)?.unwrap_or_else(fresh_cursor);
+    let mut cursor = load_cursor(connection, &path.to_string_lossy(), Some(source_id))?
+        .unwrap_or_else(fresh_cursor);
     if metadata.len() < cursor.byte_offset {
         cursor = fresh_cursor();
     }
@@ -1338,11 +1553,12 @@ fn advance_cursor_without_persisting(
             &mut cursor.state,
             account_key,
             false,
+            None,
         ) {
-            // Historical reset is deliberately lossy. A malformed complete
-            // row must not pin the migration to this byte forever, and its
-            // unknown semantics make retaining the previous identity unsafe.
-            eprintln!("[Usage] skipped malformed historical rollout row in {path}: {error}");
+            eprintln!(
+                "[Usage] skipped malformed historical rollout row in {}: {error}",
+                path.display()
+            );
             cursor.state = fresh_cursor().state;
         }
     }
@@ -1357,7 +1573,55 @@ fn advance_cursor_without_persisting(
         .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|value| value.as_secs() as i64)
         .unwrap_or_else(recorder::now_seconds);
-    save_cursor(connection, path, offset, modified_at, &cursor.state)
+    save_cursor(
+        connection,
+        &path.to_string_lossy(),
+        offset,
+        modified_at,
+        &cursor.state,
+        Some(source_id),
+    )?;
+    connection
+        .execute(
+            "UPDATE rollout_sources SET generation = generation + 1,
+             health_status = 'historical_reset', last_error = NULL,
+             last_error_at = NULL, updated_at = ?2 WHERE source_id = ?1",
+            params![source_id, recorder::now_seconds()],
+        )
+        .map_err(|error| error.to_string())?;
+    let old_binding: (Option<String>, String) = connection
+        .query_row(
+            "SELECT account_key, binding_status FROM rollout_sources WHERE source_id = ?1",
+            [source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    record_historical_reset_quarantine(
+        connection,
+        source_id,
+        old_binding.0.as_deref(),
+        &old_binding.1,
+        recorder::now_seconds(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn advance_source_cursor_without_persisting(
+    connection: &Connection,
+    source_id: &str,
+    path: &Path,
+    account_key: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    advance_source_cursor_without_persisting_in_transaction(
+        &transaction,
+        source_id,
+        path,
+        account_key,
+    )?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 /// Parser v9 deliberately starts a new account ledger instead of trying to
@@ -1371,6 +1635,11 @@ fn reset_historical_rollout_data(connection: &Connection, account_key: &str) -> 
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
+    // A legacy binding may have been written after the original schema open
+    // (and older fixtures can model that state). Import it into the durable
+    // registry before selecting reset targets; production reset decisions
+    // remain source-owned after this one-time compatibility step.
+    db::migrate_legacy_rollout_sources(&transaction)?;
     quarantine_unverified_account_data(&transaction, account_key)?;
     transaction
         .execute(
@@ -1410,52 +1679,85 @@ fn reset_historical_rollout_data(connection: &Connection, account_key: &str) -> 
         )?;
     }
 
-    // Existing unattributed files are excluded from history, but receive a
-    // state-only cursor before quarantine. If one later grows, the explicit
-    // watcher event can safely bind and collect only bytes after this reset.
-    transaction
-        .execute(
-            "UPDATE rollout_file_bindings
-             SET status = 'quarantined', reason = 'historical_reset_v9:' || ?1
-             WHERE account_key IS NULL",
-            [account_key],
-        )
-        .map_err(|error| error.to_string())?;
-
     let mut statement = transaction
         .prepare(
-            "SELECT file_path FROM rollout_file_bindings
-             WHERE (account_key = ?1 AND status = 'bound')
-                OR (account_key IS NULL AND reason = 'historical_reset_v9:' || ?1)",
+            "SELECT source_id, canonical_path, binding_status, account_key
+             FROM rollout_sources
+             WHERE (binding_status = 'verified' AND account_key = ?1)
+                OR binding_status IN ('unresolved', 'quarantined')",
         )
         .map_err(|error| error.to_string())?;
-    let paths = statement
-        .query_map([account_key], |row| row.get::<_, String>(0))
+    let sources = statement
+        .query_map([account_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     drop(statement);
 
-    for path in paths {
-        if !Path::new(&path).is_file() {
-            // A bound file can be temporarily absent (for example while it is
-            // being archived). Do not leave an old-version cursor that would
-            // cause collect_one to restart at byte zero if the file returns.
+    for (source_id, path, binding_status, source_account) in sources {
+        transaction
+            .execute(
+                "DELETE FROM rollout_turn_sources WHERE source_id = ?1",
+                [&source_id],
+            )
+            .map_err(|error| error.to_string())?;
+        let source_path = Path::new(&path);
+        if !source_path.is_file() {
             transaction
                 .execute(
-                    "UPDATE rollout_file_bindings
-                     SET account_key = NULL, status = 'quarantined',
-                         reason = 'historical_reset_v9:' || ?2
-                     WHERE file_path = ?1",
-                    params![path, account_key],
+                    "UPDATE rollout_sources SET account_key = NULL,
+                     binding_status = 'quarantined', binding_source = 'historical_reset',
+                     binding_confidence = 'unknown', last_offset = 0, last_size = 0,
+                     last_mtime = NULL, cursor_state_json = '{}',
+                     file_fingerprint = NULL, cursor_prefix_fingerprint = NULL,
+                     generation = generation + 1, health_status = 'historical_reset',
+                     updated_at = ?2 WHERE source_id = ?1",
+                    params![source_id, recorder::now_seconds()],
                 )
                 .map_err(|error| error.to_string())?;
-            transaction
-                .execute("DELETE FROM rollout_cursors WHERE file_path = ?1", [&path])
-                .map_err(|error| error.to_string())?;
+            record_historical_reset_quarantine(
+                &transaction,
+                &source_id,
+                source_account.as_deref(),
+                &binding_status,
+                recorder::now_seconds(),
+            )?;
             continue;
         }
-        advance_cursor_without_persisting(&transaction, &path, account_key)?;
+        let ledger_account = source_account
+            .clone()
+            .or_else(|| Some(format!("unresolved:source:{source_id}")))
+            .unwrap_or_else(|| account_key.to_owned());
+        advance_source_cursor_without_persisting_in_transaction(
+            &transaction,
+            &source_id,
+            source_path,
+            &ledger_account,
+        )?;
+        if binding_status != BINDING_VERIFIED {
+            transaction
+                .execute(
+                    "UPDATE rollout_sources SET account_key = NULL,
+                     binding_status = 'quarantined', binding_source = 'historical_reset',
+                     binding_confidence = 'unknown' WHERE source_id = ?1",
+                    [&source_id],
+                )
+                .map_err(|error| error.to_string())?;
+            record_historical_reset_quarantine(
+                &transaction,
+                &source_id,
+                source_account.as_deref(),
+                &binding_status,
+                recorder::now_seconds(),
+            )?;
+        }
     }
 
     set_account_data_health(
@@ -1512,11 +1814,11 @@ fn rebuild_rollout_derived_data(
     let staging_key = format!("__rollout_rebuild_v{ROLLOUT_PARSER_VERSION}__:{account_key}");
     let rebuild_batch_id = rollout_batch_id(account_key, "rebuild");
     clear_rollout_derived_data(connection, &staging_key)?;
-    reset_rollout_cursors(connection)?;
     for path in files {
-        if let Err(error) = collect_one(connection, path, &staging_key, &rebuild_batch_id) {
+        if let Err(error) =
+            collect_one_for_rebuild(connection, path, &staging_key, &rebuild_batch_id)
+        {
             clear_rollout_derived_data(connection, &staging_key)?;
-            reset_rollout_cursors(connection)?;
             set_account_data_health(connection, account_key, DATA_HEALTH_LEGACY_UNVERIFIED, 0)?;
             return Err(error);
         }
@@ -1537,7 +1839,6 @@ fn rebuild_rollout_derived_data(
             )
             .map_err(|error| error.to_string())?;
         clear_rollout_derived_data(connection, &staging_key)?;
-        reset_rollout_cursors(connection)?;
         set_account_data_health(
             connection,
             account_key,
@@ -1555,7 +1856,6 @@ fn rebuild_rollout_derived_data(
         .map_err(|error| error.to_string())?;
     if existing_turns > 0 && staged_turns == 0 {
         clear_rollout_derived_data(connection, &staging_key)?;
-        reset_rollout_cursors(connection)?;
         set_account_data_health(
             connection,
             account_key,
@@ -1566,7 +1866,6 @@ fn rebuild_rollout_derived_data(
     }
     if let Err(error) = verify_token_accounting(connection, Some(&staging_key)) {
         clear_rollout_derived_data(connection, &staging_key)?;
-        reset_rollout_cursors(connection)?;
         set_account_data_health(connection, account_key, DATA_HEALTH_LEGACY_UNVERIFIED, 0)?;
         return Err(error);
     }
@@ -1678,6 +1977,7 @@ fn discover(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+#[cfg(test)]
 fn bind_or_quarantine_rollout_file(
     connection: &Connection,
     path: &Path,
@@ -1839,14 +2139,15 @@ fn rollout_file_belongs_to_account(
     path: &Path,
     account_key: &str,
 ) -> Result<bool, String> {
-    let path_string = path.to_string_lossy().into_owned();
+    let source_id =
+        super::collector_core::register_source(connection, path, recorder::now_seconds())?;
     connection
         .query_row(
             "SELECT EXISTS(
-               SELECT 1 FROM rollout_file_bindings
-               WHERE file_path = ?1 AND account_key = ?2 AND status = 'bound'
+               SELECT 1 FROM rollout_sources
+               WHERE source_id = ?1 AND account_key = ?2 AND binding_status = 'verified'
              )",
-            params![path_string, account_key],
+            params![source_id, account_key],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())
@@ -1864,13 +2165,17 @@ fn discover_rollout_files_for_account(
     if let Some(path) = extra.filter(|path| path.is_file()) {
         discovered.push(path.to_path_buf());
     }
+    discovered.extend(
+        super::collector_core::registered_source_paths(connection)?
+            .into_iter()
+            .filter(|path| path.is_file()),
+    );
     discovered.sort();
     discovered.dedup();
 
     let mut files = Vec::new();
     for path in discovered {
-        let is_explicit_extra = extra.is_some_and(|candidate| candidate == path);
-        if bind_or_quarantine_rollout_file(connection, &path, account_key, is_explicit_extra)? {
+        if rollout_file_belongs_to_account(connection, &path, account_key)? {
             files.push(path);
         }
     }
@@ -1898,9 +2203,51 @@ pub fn collect_rollout_file(
     if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
         return Ok(false);
     }
-    let connection = db::open_database(app)?;
-    let account_key =
-        recorder::current_account_key(&connection)?.unwrap_or_else(|| "local:rollout".into());
+    let connection = db::open_database_for_collector(app)?;
+    let observed_account = recorder::current_account_key(&connection)?;
+    let account_key = observed_account
+        .clone()
+        .unwrap_or_else(|| "local:rollout".into());
+    let source_id =
+        super::collector_core::register_source(&connection, path, recorder::now_seconds())?;
+    let collector_changed = super::collector_core::catch_up_path(
+        &connection,
+        path,
+        observed_account.as_deref(),
+        true,
+        recorder::now_seconds(),
+    )?;
+    if observed_account.is_none() {
+        return Ok(collector_changed);
+    }
+    let durable_binding: Option<(Option<String>, String)> = connection
+        .query_row(
+            "SELECT account_key, binding_status FROM rollout_sources WHERE source_id = ?1",
+            [&source_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if durable_binding
+        .as_ref()
+        .is_some_and(|(bound_account, status)| {
+            status == super::collector_core::BINDING_VERIFIED
+                && bound_account.as_deref() != observed_account.as_deref()
+        })
+    {
+        // The compatibility binding table must never turn a verified source
+        // into a different account merely because the active account changed.
+        return Ok(collector_changed);
+    }
+    if durable_binding
+        .as_ref()
+        .is_some_and(|(_, status)| status == super::collector_core::BINDING_UNRESOLVED)
+    {
+        // An unresolved durable source is owned by the collector core. Do not
+        // let the legacy compatibility path infer ownership from a watcher
+        // event when the source had no new bytes/evidence.
+        return Ok(collector_changed);
+    }
     recorder::ensure_account(&connection, &account_key, recorder::now_seconds())?;
     classify_legacy_accounts(&connection)?;
     let files = discover_rollout_files_for_account(&connection, Some(path), &account_key)?;
@@ -1908,35 +2255,49 @@ pub fn collect_rollout_file(
         return Ok(false);
     }
     let _ = rebuild_rollout_derived_data(&connection, &files, &account_key)?;
-    let batch_id = rollout_batch_id(&account_key, "collect");
-    let changed = collect_one(&connection, path, &account_key, &batch_id)?;
-    if changed {
+    if collector_changed {
         super::quota::rebuild_account_intervals(&connection, &account_key)?;
     }
     refresh_account_health_after_collection(&connection, &account_key)?;
-    Ok(changed)
+    Ok(collector_changed)
 }
 
 pub fn collect_rollouts(app: &tauri::AppHandle<tauri::Wry>) -> Result<bool, String> {
-    let connection = db::open_database(app)?;
+    let connection = db::open_database_for_collector(app)?;
     let account_key =
         recorder::current_account_key(&connection)?.unwrap_or_else(|| "local:rollout".into());
     recorder::ensure_account(&connection, &account_key, recorder::now_seconds())?;
     classify_legacy_accounts(&connection)?;
-    let files = discover_rollout_files_for_account(&connection, None, &account_key)?;
-    let mut changed = rebuild_rollout_derived_data(&connection, &files, &account_key)?;
-    let batch_id = rollout_batch_id(&account_key, "collect");
-    for path in files {
-        match collect_one(&connection, &path, &account_key, &batch_id) {
-            Ok(was_changed) => changed |= was_changed,
-            Err(error) => {
-                eprintln!(
-                    "[Usage] rollout collection failed for {}: {error}",
-                    path.display()
-                );
-            }
+    let mut collector_changed = false;
+    let mut startup_paths = discover_rollout_files(None);
+    for path in super::collector_core::registered_source_paths(&connection)? {
+        if path.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+        {
+            startup_paths.push(path);
         }
     }
+    startup_paths.sort();
+    startup_paths.dedup();
+    for path in startup_paths {
+        let active_account = recorder::current_account_key(&connection)?;
+        match super::collector_core::catch_up_path(
+            &connection,
+            &path,
+            active_account.as_deref(),
+            false,
+            recorder::now_seconds(),
+        ) {
+            Ok(was_changed) => collector_changed |= was_changed,
+            Err(error) => eprintln!(
+                "[Usage] durable source catch-up failed for {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    let files = discover_rollout_files_for_account(&connection, None, &account_key)?;
+    let changed =
+        collector_changed || rebuild_rollout_derived_data(&connection, &files, &account_key)?;
     if changed {
         super::quota::rebuild_account_intervals(&connection, &account_key)?;
     }
@@ -1947,6 +2308,7 @@ pub fn collect_rollouts(app: &tauri::AppHandle<tauri::Wry>) -> Result<bool, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage::collector_core;
     use crate::usage::db::initialize_schema;
 
     #[test]
@@ -2393,12 +2755,27 @@ mod tests {
         ));
         fs::write(&path, "pending content\n").unwrap();
         assert!(bind_or_quarantine_rollout_file(&connection, &path, "account-a", true).unwrap());
+        // Completeness is production-owned by the durable source registry;
+        // the legacy fixture above is only the compatibility binding path.
+        let source_id =
+            collector_core::register_source(&connection, &path, recorder::now_seconds()).unwrap();
+        assert!(collector_core::bind_source(
+            &connection,
+            &source_id,
+            "account-a",
+            "test",
+            "high",
+            "test_verified_source",
+            None,
+            recorder::now_seconds(),
+        )
+        .unwrap());
         connection
             .execute(
-                "INSERT INTO rollout_cursors
-                 (file_path, byte_offset, last_scanned_at, state_json)
-                 VALUES (?1, 0, 1, '{}')",
-                [path.to_string_lossy().as_ref()],
+                "UPDATE rollout_sources
+                 SET last_offset = 0, last_size = 0
+                 WHERE source_id = ?1",
+                [&source_id],
             )
             .unwrap();
         let health = set_account_data_health(
@@ -2413,11 +2790,8 @@ mod tests {
 
         connection
             .execute(
-                "UPDATE rollout_cursors SET byte_offset = ?2 WHERE file_path = ?1",
-                params![
-                    path.to_string_lossy().as_ref(),
-                    fs::metadata(&path).unwrap().len() as i64
-                ],
+                "UPDATE rollout_sources SET last_offset = ?2 WHERE source_id = ?1",
+                params![source_id, fs::metadata(&path).unwrap().len() as i64],
             )
             .unwrap();
         let health = set_account_data_health(
@@ -2776,7 +3150,14 @@ mod tests {
             + r#"{"timestamp":"2026-08-14T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250,"total_tokens":250}}}}"#
             + "\n";
         fs::write(&path, fresh).unwrap();
-        collect_one(&connection, &path, "a", "after-v9").unwrap();
+        assert!(collector_core::catch_up_path(
+            &connection,
+            &path,
+            Some("a"),
+            false,
+            recorder::now_seconds(),
+        )
+        .unwrap());
         let total: i64 = connection
             .query_row(
                 "SELECT raw_total_tokens FROM turn_usage WHERE account_key = 'a'",
@@ -2828,11 +3209,9 @@ mod tests {
         assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "a").unwrap());
         let migrated: (String, i64) = connection
             .query_row(
-                "SELECT b.status, c.byte_offset
-                 FROM rollout_file_bindings b
-                 JOIN rollout_cursors c ON c.file_path = b.file_path
-                 WHERE b.file_path = ?1",
-                [path.to_string_lossy().as_ref()],
+                "SELECT binding_status, last_offset
+                 FROM rollout_sources WHERE canonical_path = ?1",
+                [path.canonicalize().unwrap().to_string_lossy().as_ref()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -2842,8 +3221,32 @@ mod tests {
             + r#"{"timestamp":"2026-08-14T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"total_tokens":150}}}}"#
             + "\n";
         fs::write(&path, fresh).unwrap();
-        assert!(bind_or_quarantine_rollout_file(&connection, &path, "a", false).unwrap());
-        assert!(collect_one(&connection, &path, "a", "after-v9").unwrap());
+        let source_id: String = connection
+            .query_row(
+                "SELECT source_id FROM rollout_sources WHERE canonical_path = ?1",
+                [path.canonicalize().unwrap().to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(collector_core::bind_source(
+            &connection,
+            &source_id,
+            "a",
+            "test_recovery",
+            "high",
+            "historical_reset_tail",
+            None,
+            recorder::now_seconds(),
+        )
+        .unwrap());
+        assert!(collector_core::catch_up_path(
+            &connection,
+            &path,
+            None,
+            false,
+            recorder::now_seconds(),
+        )
+        .unwrap());
         let total: i64 = connection
             .query_row(
                 "SELECT raw_total_tokens FROM turn_usage WHERE account_key = 'a'",
@@ -2895,8 +3298,8 @@ mod tests {
         assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "a").unwrap());
         let cursor: i64 = connection
             .query_row(
-                "SELECT byte_offset FROM rollout_cursors WHERE file_path = ?1",
-                [path.to_string_lossy().as_ref()],
+                "SELECT last_offset FROM rollout_sources WHERE canonical_path = ?1",
+                [path.canonicalize().unwrap().to_string_lossy().as_ref()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -2958,10 +3361,13 @@ mod tests {
         assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "a").unwrap());
         let migrated: (Option<String>, String, i64) = connection
             .query_row(
-                "SELECT account_key, status,
-                        (SELECT COUNT(*) FROM rollout_cursors WHERE file_path = ?1)
-                 FROM rollout_file_bindings WHERE file_path = ?1",
-                [&path_string],
+                "SELECT account_key, binding_status, last_offset
+                 FROM rollout_sources WHERE canonical_path = ?1",
+                [path
+                    .canonicalize()
+                    .unwrap_or(path.clone())
+                    .to_string_lossy()
+                    .as_ref()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -2975,14 +3381,27 @@ mod tests {
         .join("\n")
             + "\n";
         fs::write(&path, &historical).unwrap();
-        assert!(bind_or_quarantine_rollout_file(&connection, &path, "a", false).unwrap());
-        assert!(!collect_one(&connection, &path, "a", "returned-baseline").unwrap());
+        assert!(!collector_core::catch_up_path(
+            &connection,
+            &path,
+            Some("a"),
+            true,
+            recorder::now_seconds(),
+        )
+        .unwrap());
 
         let fresh = historical
             + r#"{"timestamp":"2026-08-14T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"total_tokens":150}}}}"#
             + "\n";
         fs::write(&path, fresh).unwrap();
-        assert!(collect_one(&connection, &path, "a", "returned-fresh").unwrap());
+        assert!(collector_core::catch_up_path(
+            &connection,
+            &path,
+            Some("a"),
+            true,
+            recorder::now_seconds(),
+        )
+        .unwrap());
         assert_eq!(
             connection
                 .query_row(

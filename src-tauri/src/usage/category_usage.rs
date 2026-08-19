@@ -3,8 +3,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::models::{
-    AccountDataHealth, CategoryTokenEstimate, CategoryUsage, CategoryUsageItem,
-    CategoryUsageQuotaWindow, Confidence, TokenUsageMetric, UsageMetric,
+    is_unresolved_account_key, AccountDataHealth, CategoryTokenEstimate, CategoryUsage,
+    CategoryUsageItem, CategoryUsageQuotaWindow, Confidence, TokenUsageMetric, UsageMetric,
     PROVENANCE_ACCOUNT_RATE_LIMIT, PROVENANCE_DERIVED_ESTIMATE, PROVENANCE_LOCAL_ROLLOUT,
     USAGE_STATUS_ESTIMATED, USAGE_STATUS_INSUFFICIENT_DATA, USAGE_STATUS_OBSERVED,
 };
@@ -958,11 +958,17 @@ fn server_capability(connection: &Connection, account_key: Option<&str>) -> Resu
 }
 
 pub fn category_usage(connection: &Connection, period: &str) -> Result<CategoryUsage, String> {
-    let account_key = recorder::current_account_key(connection)?;
+    let account_key = recorder::current_account_key(connection)?
+        .filter(|account_key| !is_unresolved_account_key(account_key));
+    // This function is also called through the UI's read-only connection.
+    // Health is a cached collector-owned projection; refreshes belong to the
+    // locked scheduler/data plane and must never make a query connection
+    // attempt a write.
     let data_health: Option<AccountDataHealth> = account_key
         .as_deref()
-        .map(|account_key| rollout::refresh_account_data_health(connection, account_key))
-        .transpose()?;
+        .map(|account_key| rollout::account_data_health(connection, account_key))
+        .transpose()?
+        .flatten();
     let now = Local::now();
     let (start, end, period_source, quota_window) = match period {
         "day" => {
@@ -1087,12 +1093,9 @@ pub fn app_category_usage(
     app: &tauri::AppHandle<tauri::Wry>,
     period: &str,
 ) -> Result<CategoryUsage, String> {
-    // Treat the read as a final safety-net collection point. Filesystem
-    // watcher events can be coalesced or lost while the desktop process is
-    // restarting; the page must not evaluate a stale cursor indefinitely.
-    if let Err(error) = rollout::collect_rollouts(app) {
-        eprintln!("[Usage] category read rollout recovery failed: {error}");
-    }
+    // UI reads are deliberately read-only. Rollout collection is owned by
+    // the scheduler's CollectorSessionGuard and must never be started from a
+    // query path that can be reached by an unguarded app instance.
     let connection = db::open_database(app)?;
     category_usage(&connection, period)
 }
@@ -1101,6 +1104,53 @@ pub fn app_category_usage(
 mod tests {
     use super::*;
     use crate::usage::db::initialize_schema;
+    use rusqlite::OpenFlags;
+    use std::fs;
+
+    #[test]
+    fn category_query_is_read_only_on_a_query_only_connection() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-nexus-category-read-only-{}-{}.db",
+            std::process::id(),
+            recorder::now_seconds()
+        ));
+        {
+            let connection = Connection::open(&path).unwrap();
+            initialize_schema(&connection).unwrap();
+            recorder::ensure_account(&connection, "account:query", 10).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO account_usage_data_versions
+                     (account_key, rollout_parser_version, status, timeline_status,
+                      missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+                      parse_error_count, source_incomplete_count, source_lag_seconds,
+                      updated_at)
+                     VALUES ('account:query', 9, 'verified', 'complete', 0, 0, 0, 0, 0, 0, 77)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let connection =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        connection.pragma_update(None, "query_only", true).unwrap();
+        let usage = category_usage(&connection, "day").unwrap();
+        assert_eq!(usage.account_key.as_deref(), Some("account:query"));
+        assert_eq!(usage.data_health.unwrap().data_version, 9);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT updated_at FROM account_usage_data_versions
+                     WHERE account_key = 'account:query'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            77
+        );
+        drop(connection);
+        let _ = fs::remove_file(path);
+    }
 
     fn seed_weekly_steps(connection: &Connection) {
         connection

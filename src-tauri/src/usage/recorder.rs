@@ -3,7 +3,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::models::{
-    Confidence, PROVENANCE_ACCOUNT_RATE_LIMIT, PROVENANCE_APP_SERVER_THREAD_USAGE, SOURCE_OFFICIAL,
+    is_unresolved_account_key, Confidence, PROVENANCE_ACCOUNT_RATE_LIMIT,
+    PROVENANCE_APP_SERVER_THREAD_USAGE, SOURCE_OFFICIAL,
 };
 use super::{db, quota};
 
@@ -112,6 +113,14 @@ pub fn record_account_snapshot(
             ],
         )
         .map_err(|error| error.to_string())?;
+    super::collector_core::record_account_presence(
+        connection,
+        account_key,
+        seen_at,
+        "account_read",
+        "high",
+        None,
+    )?;
     Ok(())
 }
 
@@ -119,7 +128,7 @@ pub fn record_official_snapshot(
     app: &tauri::AppHandle<tauri::Wry>,
     snapshot: &Value,
 ) -> Result<(), String> {
-    let connection = db::open_database(app)?;
+    let connection = db::open_database_for_collector(app)?;
     let account_key = snapshot_account_key(snapshot);
     let account_key = if account_key.starts_with("local:") {
         current_account_key(&connection)?.unwrap_or(account_key)
@@ -175,7 +184,7 @@ pub fn record_rate_limit_update(
     app: &tauri::AppHandle<tauri::Wry>,
     payload: &Value,
 ) -> Result<(), String> {
-    let connection = db::open_database(app)?;
+    let connection = db::open_database_for_collector(app)?;
     let Some(account_key) = current_account_key(&connection)? else {
         return Ok(());
     };
@@ -272,7 +281,7 @@ pub fn record_thread_usage_snapshot(
     thread_id: &str,
     response: &Value,
 ) -> Result<(), String> {
-    let connection = db::open_database(app)?;
+    let connection = db::open_database_for_collector(app)?;
     let Some(account_key) = current_account_key(&connection)? else {
         return Ok(());
     };
@@ -348,7 +357,7 @@ pub fn record_thread_usage_failure(
     thread_id: &str,
     error: &str,
 ) -> Result<(), String> {
-    let connection = db::open_database(app)?;
+    let connection = db::open_database_for_collector(app)?;
     let Some(account_key) = current_account_key(&connection)? else {
         return Ok(());
     };
@@ -364,14 +373,34 @@ pub fn record_thread_usage_failure(
 }
 
 pub fn current_account_key(connection: &Connection) -> Result<Option<String>, String> {
-    connection
+    let account: Option<String> = connection
         .query_row(
-            "SELECT account_key FROM accounts ORDER BY last_seen_at DESC LIMIT 1",
+            "SELECT COALESCE(
+               (SELECT account_key FROM account_presence_intervals
+                WHERE ended_at IS NULL
+                  AND account_key NOT LIKE 'unresolved:%'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM account_usage_data_versions h
+                    WHERE h.account_key = account_presence_intervals.account_key
+                      AND h.status = 'legacy_unverified'
+                  )
+                ORDER BY started_at DESC LIMIT 1),
+               (SELECT account_key FROM accounts
+                WHERE account_key NOT LIKE 'unresolved:%'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM account_usage_data_versions h
+                    WHERE h.account_key = accounts.account_key
+                      AND h.status = 'legacy_unverified'
+                  )
+                ORDER BY last_seen_at DESC LIMIT 1)
+             )",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
+        .flatten();
+    Ok(account.filter(|key| !is_unresolved_account_key(key)))
 }
 
 pub fn pending_thread_usage_threads(
