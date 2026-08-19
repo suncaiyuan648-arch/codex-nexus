@@ -206,7 +206,11 @@ export interface CategoryTokenEstimate {
   rejectedSampleCount: number;
   boundaryOverlapCount: number;
   boundaryOverlapRatio: number;
+  ambiguousBoundaryTokens: number;
+  ambiguousBoundaryRatio: number;
   dispersionRatio: number;
+  hardBlockers: string[];
+  warnings: string[];
   rejectionReasons: string[];
   externalUsageRisk: boolean;
   confidence: UsageConfidence;
@@ -236,12 +240,26 @@ export interface CategoryUsageQuotaWindow {
   resetsAt: number | null;
 }
 
+export interface AccountDataHealth {
+  accountKey: string;
+  dataVersion: number;
+  status: "verified" | "legacy_unverified" | "accounting_inconsistent" | "rebuilding";
+  timelineStatus: string;
+  missingTimelineTurns: number;
+  orphanTimelineSamples: number;
+  mismatchedTurns: number;
+  parseErrorCount: number;
+  lastRebuildBatchId: string | null;
+  verifiedAt: number | null;
+}
+
 export interface CategoryUsage {
   period: CategoryUsagePeriod;
   periodStart: number;
   periodEnd: number;
   periodSource: "local_day" | "quota_window" | "insufficient_data";
   accountKey: string | null;
+  dataHealth: AccountDataHealth | null;
   officialTokens: number | null;
   localTokens: number;
   serverUsageCapability: ServerUsageCapability;

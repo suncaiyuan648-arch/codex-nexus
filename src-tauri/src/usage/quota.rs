@@ -118,8 +118,19 @@ fn insert_step(
     }
     let local_credits: Option<f64> = connection
         .query_row(
-            "SELECT SUM(estimated_credits) FROM turn_usage
-             WHERE account_key = ?1 AND started_at > ?2 AND started_at <= ?3",
+            "SELECT SUM(
+                       CASE WHEN t.raw_total_tokens > 0
+                            THEN t.estimated_credits * s.delta_tokens
+                                 / t.raw_total_tokens
+                            ELSE 0 END
+                   )
+             FROM turn_token_samples s
+             INNER JOIN turn_usage t
+               ON t.account_key = s.account_key
+              AND t.thread_id = s.thread_id
+              AND t.turn_id = s.turn_id
+             WHERE s.account_key = ?1
+               AND s.sampled_at > ?2 AND s.sampled_at <= ?3",
             params![account_key, start.sampled_at, end.sampled_at],
             |row| row.get(0),
         )
@@ -189,6 +200,30 @@ pub fn rebuild_all_intervals(connection: &Connection) -> Result<(), String> {
         .collect::<Result<Vec<_>, _>>()?;
     for (account_key, limit_id, window) in buckets {
         refresh_intervals(connection, &account_key, &limit_id, &window)?;
+    }
+    Ok(())
+}
+
+/// Rebuild derived quota steps for one account. Account-scoped rollout
+/// migrations must not mutate another account's derived attribution.
+pub fn rebuild_account_intervals(connection: &Connection, account_key: &str) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT limit_id, window
+             FROM rate_limit_samples
+             WHERE account_key = ?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let buckets = statement
+        .query_map([account_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (limit_id, window) in buckets {
+        refresh_intervals(connection, account_key, &limit_id, &window)?;
     }
     Ok(())
 }
@@ -279,5 +314,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(step, (2, 5, 1.0));
+    }
+
+    #[test]
+    fn quota_credits_follow_token_sample_time_not_turn_start_time() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_usage
+                 (account_key, thread_id, turn_id, started_at, completed_at,
+                  reasoning_effort, speed_mode, raw_total_tokens, estimated_credits,
+                  source, confidence, created_at, updated_at)
+                 VALUES ('a', 'thread', 'long', 1, 4, 'high', 'standard',
+                         100, 10.0, 'rollout', 'high', 1, 4)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, segment_no, reasoning_effort,
+                  speed_mode, sampled_at, cumulative_tokens, delta_tokens,
+                  source, confidence)
+                 VALUES
+                   ('a', 'thread', 'long', 0, 'high', 'standard', 1, 40, 40,
+                    'rollout', 'high'),
+                   ('a', 'thread', 'long', 0, 'high', 'standard', 3, 100, 60,
+                    'rollout', 'high')",
+                [],
+            )
+            .unwrap();
+        for (timestamp, used) in [(1, 22.0), (2, 23.0), (3, 23.0), (4, 24.0)] {
+            connection
+                .execute(
+                    "INSERT INTO rate_limit_samples
+                     (account_key, sampled_at, limit_id, window, window_duration_mins,
+                      used_percent, resets_at, source, confidence)
+                     VALUES ('a', ?1, 'codex', 'primary', 10080, ?2, 100,
+                             'official', 'high')",
+                    params![timestamp, used],
+                )
+                .unwrap();
+        }
+
+        refresh_intervals(&connection, "a", "codex", "primary").unwrap();
+        let local_credits: Option<f64> = connection
+            .query_row(
+                "SELECT local_weighted_credits FROM quota_intervals",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_credits, Some(6.0));
     }
 }

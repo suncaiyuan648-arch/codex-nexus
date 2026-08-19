@@ -23,6 +23,9 @@ pub fn open_database(app: &AppHandle<Wry>) -> Result<Connection, String> {
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(|error| error.to_string())?;
     initialize_schema(&connection)?;
+    // Keep legacy/quarantined account diagnostics accurate even when the UI
+    // reads usage before the rollout collector runs.
+    super::rollout::classify_legacy_accounts(&connection)?;
     // quota_intervals is derived data. Rebuild it from the immutable raw
     // samples once when upgrading legacy adjacent-sample rows; new samples
     // are rebuilt synchronously by recorder::record_rate_limit_samples.
@@ -62,6 +65,57 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 completed_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS account_usage_data_versions (
+                account_key TEXT PRIMARY KEY,
+                rollout_parser_version INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'legacy_unverified',
+                timeline_status TEXT NOT NULL DEFAULT 'legacy_pre_timeline',
+                missing_timeline_turns INTEGER NOT NULL DEFAULT 0,
+                orphan_timeline_samples INTEGER NOT NULL DEFAULT 0,
+                mismatched_turns INTEGER NOT NULL DEFAULT 0,
+                parse_error_count INTEGER NOT NULL DEFAULT 0,
+                last_rebuild_batch_id TEXT,
+                verified_at INTEGER,
+                updated_at INTEGER NOT NULL,
+                CHECK (rollout_parser_version >= 0),
+                CHECK (missing_timeline_turns >= 0),
+                CHECK (orphan_timeline_samples >= 0),
+                CHECK (mismatched_turns >= 0),
+                CHECK (parse_error_count >= 0)
+            );
+
+            CREATE TABLE IF NOT EXISTS turn_timeline_audits (
+                account_key TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                canonical_tokens INTEGER NOT NULL,
+                timeline_tokens INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                PRIMARY KEY (account_key, thread_id, turn_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS rollout_parse_errors (
+                file_path TEXT NOT NULL,
+                byte_offset INTEGER NOT NULL,
+                error TEXT NOT NULL,
+                account_key TEXT,
+                rebuild_batch_id TEXT,
+                first_seen_at INTEGER NOT NULL,
+                PRIMARY KEY (file_path, byte_offset)
+            );
+
+            CREATE TABLE IF NOT EXISTS rollout_file_bindings (
+                file_path TEXT PRIMARY KEY,
+                account_key TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                CHECK (status IN ('bound', 'quarantined'))
+            );
+
             CREATE TABLE IF NOT EXISTS turn_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_key TEXT NOT NULL,
@@ -91,6 +145,7 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 account_key TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
                 turn_id TEXT NOT NULL,
+                segment_no INTEGER NOT NULL DEFAULT 0,
                 model TEXT,
                 reasoning_effort TEXT NOT NULL,
                 speed_mode TEXT NOT NULL,
@@ -99,7 +154,10 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 delta_tokens INTEGER NOT NULL,
                 source TEXT NOT NULL,
                 confidence TEXT NOT NULL,
-                UNIQUE (account_key, thread_id, turn_id, cumulative_tokens)
+                UNIQUE (account_key, thread_id, turn_id, segment_no, cumulative_tokens),
+                CHECK (segment_no >= 0),
+                CHECK (cumulative_tokens >= 0),
+                CHECK (delta_tokens >= 0)
             );
 
             CREATE TABLE IF NOT EXISTS account_daily_usage (
@@ -189,6 +247,14 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 ON turn_usage(account_key, started_at);
             CREATE INDEX IF NOT EXISTS idx_turn_token_samples_time
                 ON turn_token_samples(account_key, sampled_at, thread_id, turn_id);
+            CREATE INDEX IF NOT EXISTS idx_turn_token_samples_turn_segment
+                ON turn_token_samples(account_key, thread_id, turn_id, segment_no, sampled_at, id);
+            CREATE INDEX IF NOT EXISTS idx_turn_timeline_audits_account
+                ON turn_timeline_audits(account_key, reason, last_seen_at);
+            CREATE INDEX IF NOT EXISTS idx_account_usage_data_versions_status
+                ON account_usage_data_versions(status, rollout_parser_version);
+            CREATE INDEX IF NOT EXISTS idx_rollout_file_bindings_account
+                ON rollout_file_bindings(account_key, status);
             CREATE INDEX IF NOT EXISTS idx_account_daily_usage_date
                 ON account_daily_usage(account_key, date);
             CREATE INDEX IF NOT EXISTS idx_thread_usage_group_samples_time
@@ -200,6 +266,56 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
             CREATE INDEX IF NOT EXISTS idx_quota_intervals_time
                 ON quota_intervals(account_key, limit_id, window, start_at, end_at);
             ",
+        )
+        .map_err(|error| error.to_string())?;
+
+    for (table, column, definition) in [
+        (
+            "account_usage_data_versions",
+            "parse_error_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "account_usage_data_versions",
+            "last_rebuild_batch_id",
+            "TEXT",
+        ),
+        ("rollout_parse_errors", "account_key", "TEXT"),
+        ("rollout_parse_errors", "rebuild_batch_id", "TEXT"),
+    ] {
+        if table_exists(connection, table)? && !has_column(connection, table, column)? {
+            connection
+                .execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_rollout_parse_errors_account
+             ON rollout_parse_errors(account_key, rebuild_batch_id);",
+        )
+        .map_err(|error| error.to_string())?;
+
+    // Existing account-bound rows predate account-scoped parser versions.
+    // Register them as legacy without overwriting a status established by a
+    // completed account migration.
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO account_usage_data_versions
+             (account_key, rollout_parser_version, status, timeline_status,
+              missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+              verified_at, updated_at)
+             SELECT account_key, 0, 'legacy_unverified', 'legacy_pre_timeline',
+                    0, 0, 0, NULL, strftime('%s', 'now')
+             FROM (
+               SELECT account_key FROM accounts
+               UNION SELECT account_key FROM turn_usage
+               UNION SELECT account_key FROM turn_token_samples
+             )",
+            [],
         )
         .map_err(|error| error.to_string())?;
 
@@ -269,6 +385,50 @@ fn migrate_legacy_tables(connection: &Connection) -> Result<(), String> {
     let transaction = connection
         .unchecked_transaction()
         .map_err(|error| error.to_string())?;
+
+    // Before segment identity existed, a token reset could not be
+    // represented: the old unique key rejected a repeated cumulative value
+    // in the same turn. Rebuild this derived table with the versioned key
+    // while retaining existing rows as segment zero.
+    if table_exists(&transaction, "turn_token_samples")?
+        && !has_column(&transaction, "turn_token_samples", "segment_no")?
+    {
+        transaction
+            .execute_batch(
+                "
+            ALTER TABLE turn_token_samples RENAME TO turn_token_samples_legacy;
+            CREATE TABLE turn_token_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_key TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                segment_no INTEGER NOT NULL DEFAULT 0,
+                model TEXT,
+                reasoning_effort TEXT NOT NULL,
+                speed_mode TEXT NOT NULL,
+                sampled_at INTEGER NOT NULL,
+                cumulative_tokens INTEGER NOT NULL,
+                delta_tokens INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                UNIQUE (account_key, thread_id, turn_id, segment_no, cumulative_tokens),
+                CHECK (segment_no >= 0),
+                CHECK (cumulative_tokens >= 0),
+                CHECK (delta_tokens >= 0)
+            );
+            INSERT OR IGNORE INTO turn_token_samples
+              (account_key, thread_id, turn_id, segment_no, model,
+               reasoning_effort, speed_mode, sampled_at, cumulative_tokens,
+               delta_tokens, source, confidence)
+            SELECT account_key, thread_id, turn_id, 0, model,
+                   reasoning_effort, speed_mode, sampled_at, cumulative_tokens,
+                   delta_tokens, source, confidence
+            FROM turn_token_samples_legacy;
+            DROP TABLE turn_token_samples_legacy;
+            ",
+            )
+            .map_err(|error| error.to_string())?;
+    }
 
     if table_exists(&transaction, "turn_usage")?
         && !has_column(&transaction, "turn_usage", "started_at")?
@@ -417,6 +577,10 @@ mod tests {
         for table in [
             "accounts",
             "usage_migrations",
+            "account_usage_data_versions",
+            "turn_timeline_audits",
+            "rollout_parse_errors",
+            "rollout_file_bindings",
             "turn_usage",
             "turn_token_samples",
             "account_daily_usage",
@@ -504,6 +668,124 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             5
+        );
+    }
+
+    #[test]
+    fn migrates_token_samples_to_segment_aware_identity() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE turn_token_samples (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  account_key TEXT NOT NULL,
+                  thread_id TEXT NOT NULL,
+                  turn_id TEXT NOT NULL,
+                  model TEXT,
+                  reasoning_effort TEXT NOT NULL,
+                  speed_mode TEXT NOT NULL,
+                  sampled_at INTEGER NOT NULL,
+                  cumulative_tokens INTEGER NOT NULL,
+                  delta_tokens INTEGER NOT NULL,
+                  source TEXT NOT NULL,
+                  confidence TEXT NOT NULL,
+                  UNIQUE (account_key, thread_id, turn_id, cumulative_tokens)
+                );
+                INSERT INTO turn_token_samples
+                  (account_key, thread_id, turn_id, model, reasoning_effort,
+                   speed_mode, sampled_at, cumulative_tokens, delta_tokens,
+                   source, confidence)
+                VALUES ('a', 'thread', 'turn', 'gpt-5.6-sol', 'high',
+                        'standard', 1, 100, 100, 'rollout', 'high');
+                ",
+            )
+            .unwrap();
+
+        initialize_schema(&connection).unwrap();
+
+        assert!(has_column(&connection, "turn_token_samples", "segment_no").unwrap());
+        let segment: i64 = connection
+            .query_row("SELECT segment_no FROM turn_token_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(segment, 0);
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, segment_no, model,
+                  reasoning_effort, speed_mode, sampled_at, cumulative_tokens,
+                  delta_tokens, source, confidence)
+                 VALUES ('a', 'thread', 'turn', 1, 'gpt-5.6-sol', 'high',
+                         'standard', 2, 100, 100, 'rollout', 'high')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM turn_token_samples", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn migrates_parse_error_and_health_columns_without_losing_legacy_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE rollout_parse_errors (
+                  file_path TEXT NOT NULL,
+                  byte_offset INTEGER NOT NULL,
+                  error TEXT NOT NULL,
+                  first_seen_at INTEGER NOT NULL,
+                  PRIMARY KEY (file_path, byte_offset)
+                );
+                INSERT INTO rollout_parse_errors
+                  VALUES ('/tmp/legacy.jsonl', 12, 'invalid json', 1);
+                CREATE TABLE account_usage_data_versions (
+                  account_key TEXT PRIMARY KEY,
+                  rollout_parser_version INTEGER NOT NULL DEFAULT 0,
+                  status TEXT NOT NULL DEFAULT 'legacy_unverified',
+                  timeline_status TEXT NOT NULL DEFAULT 'legacy_pre_timeline',
+                  missing_timeline_turns INTEGER NOT NULL DEFAULT 0,
+                  orphan_timeline_samples INTEGER NOT NULL DEFAULT 0,
+                  mismatched_turns INTEGER NOT NULL DEFAULT 0,
+                  verified_at INTEGER,
+                  updated_at INTEGER NOT NULL
+                );
+                INSERT INTO account_usage_data_versions
+                  (account_key, updated_at) VALUES ('a', 1);
+                ",
+            )
+            .unwrap();
+        initialize_schema(&connection).unwrap();
+
+        assert!(has_column(&connection, "rollout_parse_errors", "account_key").unwrap());
+        assert!(has_column(&connection, "rollout_parse_errors", "rebuild_batch_id").unwrap());
+        assert!(has_column(
+            &connection,
+            "account_usage_data_versions",
+            "parse_error_count"
+        )
+        .unwrap());
+        assert!(has_column(
+            &connection,
+            "account_usage_data_versions",
+            "last_rebuild_batch_id"
+        )
+        .unwrap());
+        assert_eq!(
+            connection
+                .query_row("SELECT error FROM rollout_parse_errors", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "invalid json"
         );
     }
 }

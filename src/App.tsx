@@ -58,24 +58,48 @@ function confidenceLabel(value: string): string {
 
 function estimatorReasonLabel(value: string): string {
   switch (value) {
+    case "insufficient_samples":
+      return "样本不足";
     case "insufficient_valid_samples":
       return "有效样本不足";
     case "insufficient_observed_tokens":
       return "有效 Token 不足";
     case "insufficient_observed_quota":
       return "累计额度变化不足";
+    case "insufficient_quota_span":
+      return "累计额度变化不足";
     case "coverage_below_threshold":
+      return "Token coverage 不足";
+    case "insufficient_coverage":
       return "Token coverage 不足";
     case "eligible_tokens_missing":
       return "没有可归因 Token 分母";
+    case "insufficient_eligible_tokens":
+      return "没有可归因 Token 分母";
+    case "accounting_inconsistent":
+      return "Token 账本不一致";
+    case "legacy_unverified":
+      return "历史数据尚未验证";
+    case "account_data_rebuilding":
+      return "账号数据正在重建";
     case "boundary_overlap":
       return "boundary overlap 太多";
+    case "boundary_ambiguity":
+      return "跨 boundary 的 Token 不确定";
     case "mixed_category":
+      return "同一额度 step 包含多个分类";
+    case "mixed_category_unresolved":
       return "同一额度 step 包含多个分类";
     case "no_category_token":
       return "额度 step 内没有可归因 Token";
     case "dispersion_too_high":
       return "样本离散度过高";
+    case "excessive_dispersion":
+      return "样本离散度过高";
+    case "pending_tokens":
+      return "当前仍有未闭合 Token";
+    case "external_usage_risk":
+      return "存在外部或未归因 Token 风险";
     case "sanity_check_failed":
       return "数学一致性检查失败";
     case "quota_window_missing":
@@ -230,6 +254,12 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
         </p>
       ) : null}
 
+      {usage?.dataHealth && usage.dataHealth.status !== "verified" ? (
+        <p className="quota-estimate-warning">
+          当前账号数据状态为 {usage.dataHealth.status}，估算已暂停；缺失 Timeline {usage.dataHealth.missingTimelineTurns} 条、孤立 Timeline {usage.dataHealth.orphanTimelineSamples} 条、解析错误 {usage.dataHealth.parseErrorCount} 条。
+        </p>
+      ) : null}
+
       {!categories.length ? (
         <p className="muted small daily-model-usage-empty">
           {usage ? "当前额度周期暂无本地轮次 Token 记录。" : "正在读取本额度周期…"}
@@ -276,13 +306,19 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
                       <span>Token coverage</span><strong>{(estimate.coverageRatio * 100).toFixed(1)}%</strong>
                       <span>Pending Token</span><strong>{formatNumber(estimate.pendingTokens)}</strong>
                       <span>Boundary overlap</span><strong>{estimate.boundaryOverlapCount}（{(estimate.boundaryOverlapRatio * 100).toFixed(1)}%）</strong>
+                      <span>Ambiguous boundary Token</span><strong>{formatNumber(estimate.ambiguousBoundaryTokens)}（{(estimate.ambiguousBoundaryRatio * 100).toFixed(1)}%）</strong>
                       <span>样本离散度</span><strong>{Number.isFinite(estimate.dispersionRatio) ? `${(estimate.dispersionRatio * 100).toFixed(1)}%` : "不可计算"}</strong>
                       <span>预观测 Token</span><strong>{formatNumber(estimate.preObservationTokens)}</strong>
                       <span>可归因 Token</span><strong>{formatNumber(estimate.eligibleTokens)}</strong>
                     </div>
-                    {estimate.rejectionReasons.length ? (
+                    {estimate.hardBlockers.length ? (
                       <div className="quota-estimate-diagnostics-reasons">
-                        阻止原因：{estimate.rejectionReasons.map(estimatorReasonLabel).join("、")}
+                        Hard blockers：{estimate.hardBlockers.map(estimatorReasonLabel).join("、")}
+                      </div>
+                    ) : null}
+                    {estimate.warnings.length ? (
+                      <div className="quota-estimate-diagnostics-reasons">
+                        Warnings：{estimate.warnings.map(estimatorReasonLabel).join("、")}
                       </div>
                     ) : null}
                   </details>
