@@ -27,6 +27,23 @@ pub enum AccountScope {
     All,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDataHealth {
+    pub account_key: String,
+    pub data_version: i64,
+    pub status: String,
+    pub timeline_status: String,
+    pub missing_timeline_turns: i64,
+    pub orphan_timeline_samples: i64,
+    pub mismatched_turns: i64,
+    pub parse_error_count: i64,
+    pub last_rebuild_batch_id: Option<String>,
+    pub source_incomplete_count: i64,
+    pub source_lag_seconds: i64,
+    pub verified_at: Option<i64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CategoryUsageItem {
@@ -65,7 +82,13 @@ pub struct CategoryTokenEstimate {
     pub rejected_sample_count: i64,
     pub boundary_overlap_count: i64,
     pub boundary_overlap_ratio: f64,
+    pub ambiguous_boundary_tokens: i64,
+    pub ambiguous_boundary_ratio: f64,
     pub dispersion_ratio: f64,
+    pub hard_blockers: Vec<String>,
+    pub warnings: Vec<String>,
+    /// Compatibility aggregate. New consumers should use hard_blockers and
+    /// warnings so diagnostics do not control estimator eligibility.
     pub rejection_reasons: Vec<String>,
     pub external_usage_risk: bool,
     pub confidence: Confidence,
@@ -112,6 +135,7 @@ pub struct CategoryUsage {
     pub period_end: i64,
     pub period_source: String,
     pub account_key: Option<String>,
+    pub data_health: Option<AccountDataHealth>,
     pub official_tokens: Option<i64>,
     pub local_tokens: i64,
     pub server_usage_capability: String,

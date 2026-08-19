@@ -3,12 +3,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::models::{
-    CategoryTokenEstimate, CategoryUsage, CategoryUsageItem, CategoryUsageQuotaWindow, Confidence,
-    TokenUsageMetric, UsageMetric, PROVENANCE_ACCOUNT_RATE_LIMIT, PROVENANCE_DERIVED_ESTIMATE,
-    PROVENANCE_LOCAL_ROLLOUT, USAGE_STATUS_ESTIMATED, USAGE_STATUS_INSUFFICIENT_DATA,
-    USAGE_STATUS_OBSERVED,
+    AccountDataHealth, CategoryTokenEstimate, CategoryUsage, CategoryUsageItem,
+    CategoryUsageQuotaWindow, Confidence, TokenUsageMetric, UsageMetric,
+    PROVENANCE_ACCOUNT_RATE_LIMIT, PROVENANCE_DERIVED_ESTIMATE, PROVENANCE_LOCAL_ROLLOUT,
+    USAGE_STATUS_ESTIMATED, USAGE_STATUS_INSUFFICIENT_DATA, USAGE_STATUS_OBSERVED,
 };
-use super::{db, quota, recorder};
+use super::{db, quota, recorder, rollout};
 
 #[derive(Clone, Debug, Default)]
 struct LocalAggregate {
@@ -109,53 +109,22 @@ fn local_category_usage(
     let Some(account_key) = account_key else {
         return Ok((BTreeMap::new(), 0));
     };
+    // The sample timeline is the only source that can attribute a long turn
+    // to the time it actually produced tokens. Using turn_usage.started_at
+    // here would assign a turn that spans the boundary entirely to its start
+    // bucket and would double-count it when a later timeline correction is
+    // applied.
     let mut statement = connection
         .prepare(
-            "SELECT COALESCE(model, 'unknown'), reasoning_effort, speed_mode,
-                    raw_total_tokens
-             FROM turn_usage
-             WHERE account_key = ?1 AND started_at >= ?2 AND started_at < ?3",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map(params![account_key, start, end], |row| {
-            Ok((
-                (
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ),
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?;
-    let mut categories: BTreeMap<CategoryKey, LocalAggregate> = BTreeMap::new();
-    let mut total: i64 = 0;
-    for row in rows {
-        let (key, tokens) = row.map_err(|error| error.to_string())?;
-        let entry = categories.entry(key).or_default();
-        entry.tokens = entry.tokens.saturating_add(tokens.max(0));
-        entry.turn_count += 1;
-        total = total.saturating_add(tokens.max(0));
-    }
-
-    // A turn can start before the requested period and continue producing
-    // tokens inside it. Its final turn total cannot place those tokens on the
-    // period timeline, so add only timeline deltas belonging to turns that
-    // started before the period. Turns that started inside the period remain
-    // represented by their canonical turn total above, avoiding double count.
-    let mut statement = connection
-        .prepare(
-            "SELECT s.model, s.reasoning_effort, s.speed_mode,
+            "SELECT COALESCE(s.model, 'unknown'), s.reasoning_effort, s.speed_mode,
                     SUM(s.delta_tokens), COUNT(DISTINCT s.thread_id || ':' || s.turn_id)
              FROM turn_token_samples s
-             LEFT JOIN turn_usage t
+             INNER JOIN turn_usage t
                ON t.account_key = s.account_key
               AND t.thread_id = s.thread_id
               AND t.turn_id = s.turn_id
              WHERE s.account_key = ?1
                AND s.sampled_at >= ?2 AND s.sampled_at < ?3
-               AND (t.started_at IS NULL OR t.started_at < ?2)
              GROUP BY s.model, s.reasoning_effort, s.speed_mode",
         )
         .map_err(|error| error.to_string())?;
@@ -173,6 +142,8 @@ fn local_category_usage(
             ))
         })
         .map_err(|error| error.to_string())?;
+    let mut categories: BTreeMap<CategoryKey, LocalAggregate> = BTreeMap::new();
+    let mut total: i64 = 0;
     for row in rows {
         let (key, tokens, turn_count) = row.map_err(|error| error.to_string())?;
         let entry = categories.entry(key).or_default();
@@ -200,7 +171,6 @@ struct QuotaStep {
 #[derive(Clone, Debug)]
 struct TokenDeltaSample {
     key: CategoryKey,
-    turn_started_at: Option<i64>,
     sampled_at: i64,
     delta_tokens: i64,
     previous_sampled_at: Option<i64>,
@@ -212,12 +182,17 @@ struct CategoryEstimateAccumulator {
     observed_sample_count: i64,
     valid_sample_count: i64,
     observed_tokens: i64,
+    candidate_tokens: i64,
+    excluded_tokens: i64,
+    ambiguous_boundary_tokens: i64,
     observed_quota_percent: f64,
     pre_observation_tokens: i64,
     pending_tokens: i64,
     rejected_sample_count: i64,
     boundary_overlap_count: i64,
     rates: Vec<(f64, f64)>,
+    hard_blockers: Vec<String>,
+    warnings: Vec<String>,
     rejection_reasons: Vec<String>,
 }
 
@@ -225,6 +200,28 @@ fn add_rejection_reason(value: &mut CategoryEstimateAccumulator, reason: &str) {
     if !value.rejection_reasons.iter().any(|item| item == reason) {
         value.rejection_reasons.push(reason.into());
     }
+    let destination = match reason {
+        "boundary_overlap"
+        | "boundary_ambiguity"
+        | "pending_tokens"
+        | "external_usage_risk"
+        | "pre_observation_tokens"
+        | "source_gap"
+        | "mixed_category_unresolved" => &mut value.warnings,
+        _ => &mut value.hard_blockers,
+    };
+    if !destination.iter().any(|item| item == reason) {
+        destination.push(reason.into());
+    }
+}
+
+fn diagnostic_reasons(value: &CategoryEstimateAccumulator) -> Vec<String> {
+    value
+        .hard_blockers
+        .iter()
+        .chain(value.warnings.iter())
+        .cloned()
+        .collect()
 }
 
 fn quota_steps(
@@ -270,48 +267,42 @@ fn timeline_token_samples(
     let mut statement = connection
         .prepare(
             "SELECT s.thread_id, s.turn_id, COALESCE(s.model, 'unknown'),
-                    s.reasoning_effort, s.speed_mode, s.sampled_at, s.delta_tokens,
-                    t.started_at
-             FROM turn_token_samples
-             s LEFT JOIN turn_usage t
+                    s.reasoning_effort, s.speed_mode, s.sampled_at, s.delta_tokens
+             FROM turn_token_samples s
+             INNER JOIN turn_usage t
                ON t.account_key = s.account_key
               AND t.thread_id = s.thread_id
               AND t.turn_id = s.turn_id
              WHERE s.account_key = ?1
-               AND s.sampled_at >= ?2 AND s.sampled_at <= ?3
+               AND s.sampled_at <= ?2
              ORDER BY s.thread_id, s.turn_id, s.sampled_at, s.id",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(
-            params![account_key, start.saturating_sub(7 * 24 * 60 * 60), end],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    (
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ),
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                ))
-            },
-        )
+        .query_map(params![account_key, end], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                (
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ),
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
         .map_err(|error| error.to_string())?;
     let mut previous_by_turn: HashMap<(String, String), i64> = HashMap::new();
     let mut samples = Vec::new();
     for row in rows {
-        let (thread_id, turn_id, key, sampled_at, delta_tokens, turn_started_at) =
+        let (thread_id, turn_id, key, sampled_at, delta_tokens) =
             row.map_err(|error| error.to_string())?;
         let turn_key = (thread_id.clone(), turn_id.clone());
         let previous_sampled_at = previous_by_turn.insert(turn_key, sampled_at);
         if sampled_at > start && sampled_at <= end && delta_tokens > 0 {
             samples.push(TokenDeltaSample {
                 key,
-                turn_started_at,
                 sampled_at,
                 delta_tokens,
                 previous_sampled_at,
@@ -399,10 +390,30 @@ fn estimate_weekly_categories(
                 add_rejection_reason(&mut value, "quota_window_missing");
                 (
                     key,
-                    insufficient_estimate(value, 0.0, 0.0, PROVENANCE_DERIVED_ESTIMATE),
+                    insufficient_estimate(value, 0.0, 0.0, 0.0, PROVENANCE_DERIVED_ESTIMATE),
                 )
             })
             .collect());
+    };
+
+    // A category estimate is not allowed to paper over a broken lower-level
+    // ledger. Keep this as a category diagnostic so the UI can still expose
+    // the failure instead of turning it into an RPC error or a clamped ratio.
+    let account_health_blocker = match account_key {
+        Some(account_key) => match rollout::account_data_health(connection, account_key)? {
+            Some(health) if health.status == rollout::DATA_HEALTH_VERIFIED => None,
+            Some(health) if health.status == rollout::DATA_HEALTH_REBUILDING => {
+                Some("account_data_rebuilding")
+            }
+            Some(health) if health.status == rollout::DATA_HEALTH_ACCOUNTING_INCONSISTENT => {
+                Some("accounting_inconsistent")
+            }
+            Some(health) if health.status == rollout::DATA_HEALTH_SOURCE_INCOMPLETE => {
+                Some("source_incomplete")
+            }
+            _ => Some("legacy_unverified"),
+        },
+        None => Some("legacy_unverified"),
     };
 
     let steps = quota_steps(
@@ -418,41 +429,7 @@ fn estimate_weekly_categories(
         .transpose()?
         .unwrap_or_default();
     let observation_horizon = steps.first().map(|step| step.start_at).unwrap_or(end);
-    if let Some(account_key) = account_key {
-        let mut statement = connection
-            .prepare(
-                "SELECT COALESCE(model, 'unknown'), reasoning_effort, speed_mode,
-                        SUM(raw_total_tokens)
-                 FROM turn_usage
-                 WHERE account_key = ?1
-                   AND started_at >= ?2 AND started_at < ?3
-                 GROUP BY model, reasoning_effort, speed_mode",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(params![account_key, start, observation_horizon], |row| {
-                Ok((
-                    (
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ),
-                    row.get::<_, Option<i64>>(3)?.unwrap_or_default().max(0),
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-        for row in rows {
-            let (key, tokens) = row.map_err(|error| error.to_string())?;
-            if let Some(accumulator) = accumulators.get_mut(&key) {
-                accumulator.pre_observation_tokens =
-                    accumulator.pre_observation_tokens.saturating_add(tokens);
-            }
-        }
-    }
     for step in &steps {
-        for value in accumulators.values_mut() {
-            value.observed_sample_count += 1;
-        }
         let mut categories_in_step = BTreeSet::new();
         let mut valid_tokens_by_category: BTreeMap<CategoryKey, i64> = BTreeMap::new();
         let mut boundary_categories = BTreeSet::new();
@@ -460,39 +437,76 @@ fn estimate_weekly_categories(
             .iter()
             .filter(|sample| sample.sampled_at > step.start_at && sample.sampled_at <= step.end_at)
         {
+            let sample_tokens = sample.delta_tokens.max(0);
             categories_in_step.insert(sample.key.clone());
+            if let Some(accumulator) = accumulators.get_mut(&sample.key) {
+                accumulator.candidate_tokens =
+                    accumulator.candidate_tokens.saturating_add(sample_tokens);
+            }
             let crosses_step_start = sample
                 .previous_sampled_at
                 .is_some_and(|previous| previous < step.start_at);
             if crosses_step_start {
                 boundary_categories.insert(sample.key.clone());
+                if let Some(accumulator) = accumulators.get_mut(&sample.key) {
+                    accumulator.ambiguous_boundary_tokens = accumulator
+                        .ambiguous_boundary_tokens
+                        .saturating_add(sample_tokens);
+                }
                 continue;
             }
             let entry = valid_tokens_by_category
                 .entry(sample.key.clone())
                 .or_default();
-            *entry = entry.saturating_add(sample.delta_tokens.max(0));
+            *entry = entry.saturating_add(sample_tokens);
+        }
+
+        if categories_in_step.is_empty() {
+            // A quota transition with no local Token sample is a source gap,
+            // not evidence that every category has too few observations.
+            for value in accumulators.values_mut() {
+                add_rejection_reason(value, "source_gap");
+            }
+            continue;
+        }
+        for key in &categories_in_step {
+            if let Some(accumulator) = accumulators.get_mut(key) {
+                accumulator.observed_sample_count += 1;
+            }
         }
 
         for key in &boundary_categories {
             if let Some(accumulator) = accumulators.get_mut(key) {
                 accumulator.boundary_overlap_count += 1;
                 add_rejection_reason(accumulator, "boundary_overlap");
+                add_rejection_reason(accumulator, "boundary_ambiguity");
             }
         }
 
         if categories_in_step.len() != 1 {
-            for value in accumulators.values_mut() {
-                value.rejected_sample_count += 1;
-                add_rejection_reason(
-                    value,
-                    if categories_in_step.is_empty() {
-                        "no_category_token"
-                    } else {
-                        "mixed_category"
-                    },
-                );
+            for sample in timeline_samples.iter().filter(|sample| {
+                sample.sampled_at > step.start_at && sample.sampled_at <= step.end_at
+            }) {
+                let crosses_step_start = sample
+                    .previous_sampled_at
+                    .is_some_and(|previous| previous < step.start_at);
+                if !crosses_step_start {
+                    if let Some(accumulator) = accumulators.get_mut(&sample.key) {
+                        accumulator.excluded_tokens = accumulator
+                            .excluded_tokens
+                            .saturating_add(sample.delta_tokens.max(0));
+                    }
+                }
             }
+            for key in &categories_in_step {
+                if let Some(value) = accumulators.get_mut(key) {
+                    value.rejected_sample_count += 1;
+                    add_rejection_reason(value, "mixed_category_unresolved");
+                }
+            }
+            // Mixed steps are excluded from every involved category's
+            // evidence, but remain warnings. A single mixed step must not
+            // erase otherwise valid pure-category observations.
             continue;
         }
 
@@ -506,14 +520,10 @@ fn estimate_weekly_categories(
         };
         if tokens <= 0 {
             accumulator.rejected_sample_count += 1;
-            add_rejection_reason(
-                accumulator,
-                if boundary_categories.contains(&key) {
-                    "boundary_overlap"
-                } else {
-                    "no_category_token"
-                },
-            );
+            if !boundary_categories.contains(&key) {
+                add_rejection_reason(accumulator, "insufficient_observed_tokens");
+            }
+            accumulator.excluded_tokens = accumulator.excluded_tokens.saturating_add(tokens.max(0));
             continue;
         }
         accumulator.valid_sample_count += 1;
@@ -527,12 +537,7 @@ fn estimate_weekly_categories(
 
     let pending_start = steps.last().map(|step| step.end_at).unwrap_or(start);
     for sample in &timeline_samples {
-        if sample.sampled_at <= observation_horizon
-            && sample
-                .turn_started_at
-                .map(|started_at| started_at < start)
-                .unwrap_or(true)
-        {
+        if sample.sampled_at <= observation_horizon {
             if let Some(accumulator) = accumulators.get_mut(&sample.key) {
                 accumulator.pre_observation_tokens = accumulator
                     .pre_observation_tokens
@@ -551,14 +556,43 @@ fn estimate_weekly_categories(
     Ok(accumulators
         .into_iter()
         .map(|(key, mut value)| {
-            let current_tokens = value.current_tokens;
-            let eligible_tokens =
-                (current_tokens - value.pre_observation_tokens - value.pending_tokens).max(0);
+            let total_category_tokens = value.current_tokens.max(0);
+            let current_tokens = total_category_tokens;
+            let raw_eligible_tokens =
+                current_tokens - value.pre_observation_tokens - value.pending_tokens;
+            let eligible_tokens = raw_eligible_tokens
+                .saturating_sub(value.excluded_tokens)
+                .saturating_sub(value.ambiguous_boundary_tokens)
+                .max(0);
             let coverage_ratio = if eligible_tokens > 0 {
-                (value.observed_tokens as f64 / eligible_tokens as f64).clamp(0.0, 1.0)
+                value.observed_tokens as f64 / eligible_tokens as f64
+            } else if value.observed_tokens > 0 {
+                // Keep the raw invariant failure visible to diagnostics. Do
+                // not clamp it into an apparently valid 100% coverage.
+                value.observed_tokens as f64
             } else {
                 0.0
             };
+            let ambiguous_boundary_ratio = if value.candidate_tokens > 0 {
+                value.ambiguous_boundary_tokens as f64 / value.candidate_tokens as f64
+            } else {
+                0.0
+            };
+            let accounted_step_tokens = value
+                .observed_tokens
+                .saturating_add(value.ambiguous_boundary_tokens)
+                .saturating_add(value.excluded_tokens);
+            if let Some(reason) = account_health_blocker {
+                add_rejection_reason(&mut value, reason);
+            }
+            if raw_eligible_tokens < 0
+                || value.observed_tokens > eligible_tokens
+                || eligible_tokens > total_category_tokens
+                || value.candidate_tokens > raw_eligible_tokens
+                || accounted_step_tokens != value.candidate_tokens
+            {
+                add_rejection_reason(&mut value, "accounting_inconsistent");
+            }
             let rate_values = value
                 .rates
                 .iter()
@@ -574,19 +608,19 @@ fn estimate_weekly_categories(
             let current_quota_lower_bound =
                 full_week_tokens as f64 * quota_window.used_percent.clamp(0.0, 100.0) / 100.0;
             if value.valid_sample_count < MIN_VALID_SAMPLES {
-                add_rejection_reason(&mut value, "insufficient_valid_samples");
+                add_rejection_reason(&mut value, "insufficient_samples");
             }
             if value.observed_tokens < MIN_OBSERVED_TOKENS {
                 add_rejection_reason(&mut value, "insufficient_observed_tokens");
             }
             if value.observed_quota_percent < MIN_OBSERVED_QUOTA_PERCENT {
-                add_rejection_reason(&mut value, "insufficient_observed_quota");
+                add_rejection_reason(&mut value, "insufficient_quota_span");
             }
             if coverage_ratio < MIN_COVERAGE_RATIO {
-                add_rejection_reason(&mut value, "coverage_below_threshold");
+                add_rejection_reason(&mut value, "insufficient_coverage");
             }
             if current_tokens > 0 && eligible_tokens <= 0 {
-                add_rejection_reason(&mut value, "eligible_tokens_missing");
+                add_rejection_reason(&mut value, "insufficient_eligible_tokens");
             }
             if full_week_tokens < current_tokens
                 || current_quota_lower_bound + 1.0 < current_tokens as f64
@@ -594,9 +628,18 @@ fn estimate_weekly_categories(
                 add_rejection_reason(&mut value, "sanity_check_failed");
             }
             if dispersion > MAX_DISPERSION_RATIO {
-                add_rejection_reason(&mut value, "dispersion_too_high");
+                add_rejection_reason(&mut value, "excessive_dispersion");
             }
-            let estimate = if value.rejection_reasons.is_empty() {
+            if value.pending_tokens > 0 {
+                add_rejection_reason(&mut value, "pending_tokens");
+            }
+            if value.pre_observation_tokens > 0 || coverage_ratio < 1.0 {
+                add_rejection_reason(&mut value, "external_usage_risk");
+            }
+            let hard_blockers = value.hard_blockers.clone();
+            let warnings = value.warnings.clone();
+            let rejection_reasons = diagnostic_reasons(&value);
+            let estimate = if hard_blockers.is_empty() {
                 let remaining_tokens =
                     ((full_week_tokens as f64 * quota_window.remaining_percent.max(0.0)) / 100.0)
                         .round()
@@ -623,10 +666,13 @@ fn estimate_weekly_categories(
                     } else {
                         0.0
                     },
+                    ambiguous_boundary_tokens: value.ambiguous_boundary_tokens,
+                    ambiguous_boundary_ratio,
                     dispersion_ratio: dispersion,
-                    rejection_reasons: value.rejection_reasons,
-                    external_usage_risk: coverage_ratio < 1.0
-                        || value.pre_observation_tokens > 0
+                    hard_blockers,
+                    warnings,
+                    rejection_reasons,
+                    external_usage_risk: value.pre_observation_tokens > 0
                         || value.pending_tokens > 0,
                     confidence: if coverage_ratio >= 0.85 && dispersion <= 0.35 {
                         Confidence::High
@@ -640,6 +686,7 @@ fn estimate_weekly_categories(
                     value,
                     coverage_ratio,
                     dispersion,
+                    ambiguous_boundary_ratio,
                     PROVENANCE_DERIVED_ESTIMATE,
                 )
             };
@@ -652,14 +699,24 @@ fn insufficient_estimate(
     value: CategoryEstimateAccumulator,
     coverage_ratio: f64,
     dispersion: f64,
+    ambiguous_boundary_ratio: f64,
     source: &str,
 ) -> CategoryTokenEstimate {
+    let eligible_tokens = (value.current_tokens
+        - value.pre_observation_tokens
+        - value.pending_tokens
+        - value.excluded_tokens
+        - value.ambiguous_boundary_tokens)
+        .max(0);
+    let hard_blockers = value.hard_blockers.clone();
+    let warnings = value.warnings.clone();
+    let rejection_reasons = diagnostic_reasons(&value);
     CategoryTokenEstimate {
         status: USAGE_STATUS_INSUFFICIENT_DATA.into(),
         estimated_tokens: None,
         remaining_tokens: None,
         current_tokens: value.current_tokens,
-        total_category_tokens: value.current_tokens,
+        total_category_tokens: value.current_tokens.max(0),
         observed_sample_count: value.observed_sample_count,
         valid_sample_count: value.valid_sample_count,
         observed_tokens: value.observed_tokens,
@@ -667,10 +724,7 @@ fn insufficient_estimate(
         cumulative_observed_quota_delta: value.observed_quota_percent,
         coverage_ratio,
         pre_observation_tokens: value.pre_observation_tokens,
-        eligible_tokens: (value.current_tokens
-            - value.pre_observation_tokens
-            - value.pending_tokens)
-            .max(0),
+        eligible_tokens,
         pending_tokens: value.pending_tokens,
         rejected_sample_count: value.rejected_sample_count,
         boundary_overlap_count: value.boundary_overlap_count,
@@ -679,11 +733,13 @@ fn insufficient_estimate(
         } else {
             0.0
         },
+        ambiguous_boundary_tokens: value.ambiguous_boundary_tokens,
+        ambiguous_boundary_ratio,
         dispersion_ratio: dispersion,
-        rejection_reasons: value.rejection_reasons,
-        external_usage_risk: coverage_ratio < 1.0
-            || value.pre_observation_tokens > 0
-            || value.pending_tokens > 0,
+        hard_blockers,
+        warnings,
+        rejection_reasons,
+        external_usage_risk: value.pre_observation_tokens > 0 || value.pending_tokens > 0,
         confidence: Confidence::Low,
         source: source.into(),
     }
@@ -906,6 +962,11 @@ fn server_capability(connection: &Connection, account_key: Option<&str>) -> Resu
 
 pub fn category_usage(connection: &Connection, period: &str) -> Result<CategoryUsage, String> {
     let account_key = recorder::current_account_key(connection)?;
+    let data_health: Option<AccountDataHealth> = account_key
+        .as_deref()
+        .map(|account_key| rollout::account_data_health(connection, account_key))
+        .transpose()?
+        .flatten();
     let now = Local::now();
     let (start, end, period_source, quota_window) = match period {
         "day" => {
@@ -1015,6 +1076,7 @@ pub fn category_usage(connection: &Connection, period: &str) -> Result<CategoryU
         period_end: end,
         period_source,
         account_key: account_key.clone(),
+        data_health,
         official_tokens: official_tokens(connection, account_key.as_deref(), start, end)?,
         local_tokens: local_total,
         server_usage_capability: capability,
@@ -1076,6 +1138,134 @@ mod tests {
                 params![turn_id, model, sampled_at, cumulative_tokens, delta_tokens],
             )
             .unwrap();
+        let canonical_tokens: i64 = connection
+            .query_row(
+                "SELECT SUM(delta_tokens) FROM turn_token_samples
+                 WHERE account_key = 'a' AND thread_id = 'thread' AND turn_id = ?1",
+                [turn_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_usage
+                 (account_key, thread_id, turn_id, started_at, completed_at, model,
+                  reasoning_effort, speed_mode, raw_total_tokens, source, confidence,
+                  created_at, updated_at)
+                 VALUES ('a', 'thread', ?1, ?2, ?2, ?3, 'xhigh', 'standard',
+                         ?4, 'rollout', 'high', ?2, ?2)
+                 ON CONFLICT(account_key, thread_id, turn_id) DO UPDATE SET
+                   completed_at = excluded.completed_at,
+                   raw_total_tokens = excluded.raw_total_tokens,
+                   updated_at = excluded.updated_at",
+                params![turn_id, sampled_at, model, canonical_tokens],
+            )
+            .unwrap();
+        mark_account_verified(connection);
+    }
+
+    fn mark_account_verified(connection: &Connection) {
+        connection
+            .execute(
+                "INSERT INTO account_usage_data_versions
+                 (account_key, rollout_parser_version, status, timeline_status,
+                  missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+                  verified_at, updated_at)
+                 VALUES ('a', ?1, 'verified', 'complete', 0, 0, 0, 1, 1)
+                 ON CONFLICT(account_key) DO UPDATE SET
+                   rollout_parser_version = excluded.rollout_parser_version,
+                   status = excluded.status,
+                   timeline_status = excluded.timeline_status,
+                   missing_timeline_turns = 0,
+                   orphan_timeline_samples = 0,
+                   mismatched_turns = 0,
+                   verified_at = 1,
+                   updated_at = 1",
+                [rollout::ROLLOUT_PARSER_VERSION],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn local_usage_is_attributed_by_token_sample_time() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        for (sampled_at, delta_tokens) in [(900, 5), (1500, 7), (2500, 11)] {
+            insert_timeline_sample(
+                &connection,
+                "long-turn",
+                "gpt-5.6-sol",
+                sampled_at,
+                delta_tokens,
+                delta_tokens,
+            );
+        }
+
+        let (categories, total) = local_category_usage(&connection, Some("a"), 1000, 2000).unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(
+            categories
+                .get(&("gpt-5.6-sol".into(), "xhigh".into(), "standard".into()))
+                .map(|value| (value.tokens, value.turn_count)),
+            Some((7, 1))
+        );
+    }
+
+    #[test]
+    fn orphan_timeline_is_quarantined_from_category_usage_and_estimator() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        insert_timeline_sample(&connection, "valid", "gpt-5.6-sol", 2500, 1_000, 1_000);
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, model, reasoning_effort, speed_mode,
+                  sampled_at, cumulative_tokens, delta_tokens, source, confidence)
+                 VALUES ('a', 'thread', 'orphan', 'gpt-5.6-sol', 'xhigh', 'standard',
+                         2600, 5000, 5000, 'rollout', 'high')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE account_usage_data_versions
+                 SET status = 'accounting_inconsistent', orphan_timeline_samples = 1
+                 WHERE account_key = 'a'",
+                [],
+            )
+            .unwrap();
+
+        let samples = timeline_token_samples(&connection, "a", 1000, 10_000).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].delta_tokens, 1_000);
+        let (categories, total) =
+            local_category_usage(&connection, Some("a"), 1000, 10_000).unwrap();
+        assert_eq!(total, 1_000);
+
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 16.0,
+            remaining_percent: 84.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimate = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10_000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap()
+        .remove(&("gpt-5.6-sol".into(), "xhigh".into(), "standard".into()))
+        .unwrap();
+        assert!(estimate
+            .hard_blockers
+            .iter()
+            .any(|reason| reason == "accounting_inconsistent"));
     }
 
     fn single_category_tokens(
@@ -1227,6 +1417,7 @@ mod tests {
                 )
                 .unwrap();
         }
+        mark_account_verified(&connection);
         quota::refresh_intervals(&connection, "a", "weekly", "primary").unwrap();
         let mut categories = BTreeMap::new();
         categories.insert(
@@ -1278,6 +1469,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        mark_account_verified(&connection);
         connection
             .execute(
                 "INSERT INTO turn_token_samples
@@ -1335,19 +1527,22 @@ mod tests {
     fn long_turn_crossing_a_quota_step_boundary_keeps_token_deltas() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
-        connection
-            .execute(
-                "INSERT INTO turn_token_samples
-                 (account_key, thread_id, turn_id, model, reasoning_effort, speed_mode,
-                  sampled_at, cumulative_tokens, delta_tokens, source, confidence)
-                 VALUES
-                   ('a', 'thread', 'long', 'gpt-5.6-sol', 'high', 'standard',
-                    1500, 5000000, 5000000, 'rollout', 'high'),
-                   ('a', 'thread', 'long', 'gpt-5.6-sol', 'high', 'standard',
-                    2500, 12000000, 7000000, 'rollout', 'high')",
-                [],
-            )
-            .unwrap();
+        insert_timeline_sample(
+            &connection,
+            "long",
+            "gpt-5.6-sol",
+            1500,
+            5_000_000,
+            5_000_000,
+        );
+        insert_timeline_sample(
+            &connection,
+            "long",
+            "gpt-5.6-sol",
+            2500,
+            12_000_000,
+            7_000_000,
+        );
         let samples = timeline_token_samples(&connection, "a", 1000, 3000).unwrap();
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].previous_sampled_at, None);
@@ -1412,8 +1607,95 @@ mod tests {
             assert!(estimate
                 .rejection_reasons
                 .iter()
-                .any(|reason| reason == "mixed_category"));
+                .any(|reason| reason == "mixed_category_unresolved"));
         }
+    }
+
+    #[test]
+    fn one_mixed_step_does_not_block_categories_with_five_pure_steps() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        for timestamp in 1000..=9000 {
+            if timestamp % 1000 != 0 {
+                continue;
+            }
+            connection
+                .execute(
+                    "INSERT INTO rate_limit_samples
+                     (account_key, sampled_at, limit_id, window, window_duration_mins,
+                      used_percent, resets_at, source, confidence)
+                     VALUES ('a', ?1, 'weekly', 'primary', 10080, ?2, 20000,
+                             'account_rate_limit', 'high')",
+                    params![timestamp, 10.0 + (timestamp / 1000) as f64],
+                )
+                .unwrap();
+        }
+        for (index, sampled_at) in [2500, 3500, 4500, 5500, 6500].into_iter().enumerate() {
+            insert_timeline_sample(
+                &connection,
+                &format!("pure-{index}"),
+                "gpt-5.6-luna",
+                sampled_at,
+                2_000,
+                2_000,
+            );
+        }
+        insert_timeline_sample(
+            &connection,
+            "mixed-luna",
+            "gpt-5.6-luna",
+            7500,
+            2_000,
+            2_000,
+        );
+        insert_timeline_sample(&connection, "mixed-sol", "gpt-5.6-sol", 7500, 1_000, 1_000);
+        quota::refresh_intervals(&connection, "a", "weekly", "primary").unwrap();
+
+        let mut categories = BTreeMap::new();
+        categories.insert(
+            ("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()),
+            LocalAggregate {
+                tokens: 12_000,
+                turn_count: 6,
+            },
+        );
+        categories.insert(
+            ("gpt-5.6-sol".into(), "xhigh".into(), "standard".into()),
+            LocalAggregate {
+                tokens: 1_000,
+                turn_count: 1,
+            },
+        );
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 18.0,
+            remaining_percent: 82.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimates = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10_000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap();
+        let luna = estimates
+            .get(&("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()))
+            .unwrap();
+        assert_eq!(luna.valid_sample_count, 5);
+        assert_eq!(luna.status, USAGE_STATUS_ESTIMATED);
+        assert!(!luna
+            .hard_blockers
+            .iter()
+            .any(|reason| reason == "mixed_category_unresolved"));
+        assert!(luna
+            .warnings
+            .iter()
+            .any(|reason| reason == "mixed_category_unresolved"));
     }
 
     #[test]
@@ -1463,6 +1745,59 @@ mod tests {
             .rejection_reasons
             .iter()
             .any(|reason| reason == "boundary_overlap"));
+        assert_eq!(estimate.ambiguous_boundary_tokens, 5_000_000);
+        assert!(estimate.ambiguous_boundary_ratio > 0.6);
+        assert!(!estimate
+            .hard_blockers
+            .iter()
+            .any(|reason| reason == "boundary_overlap"));
+        assert!(estimate
+            .warnings
+            .iter()
+            .any(|reason| reason == "boundary_ambiguity"));
+    }
+
+    #[test]
+    fn observed_tokens_above_eligible_tokens_is_a_hard_accounting_blocker() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        for (index, sampled_at) in [2500, 3500, 4500, 5500, 6500].into_iter().enumerate() {
+            insert_timeline_sample(
+                &connection,
+                &format!("inconsistent-{index}"),
+                "gpt-5.6-sol",
+                sampled_at,
+                1_000,
+                1_000,
+            );
+        }
+        let categories = single_category_tokens(&connection, "gpt-5.6-sol", 3_000);
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 16.0,
+            remaining_percent: 84.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimate = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap()
+        .remove(&("gpt-5.6-sol".into(), "xhigh".into(), "standard".into()))
+        .unwrap();
+        assert_eq!(estimate.status, USAGE_STATUS_INSUFFICIENT_DATA);
+        assert!(estimate.coverage_ratio > 1.0);
+        assert!(estimate
+            .hard_blockers
+            .iter()
+            .any(|reason| reason == "accounting_inconsistent"));
     }
 
     #[test]
@@ -1597,6 +1932,9 @@ mod tests {
         .remove(&("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()))
         .unwrap();
         assert_eq!(estimate.status, USAGE_STATUS_INSUFFICIENT_DATA);
-        assert!(estimate.rejection_reasons.iter().any(|reason| reason == "sanity_check_failed"));
+        assert!(estimate
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason == "sanity_check_failed"));
     }
 }
