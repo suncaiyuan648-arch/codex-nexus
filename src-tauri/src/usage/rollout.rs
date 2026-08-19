@@ -10,11 +10,12 @@ use std::{
 use super::models::{AccountDataHealth, Confidence, TokenUsage, TurnUsageRecord, SOURCE_ROLLOUT};
 use super::{db, rate_card::RateCard, recorder};
 
-pub const ROLLOUT_PARSER_VERSION: i64 = 3;
+pub const ROLLOUT_PARSER_VERSION: i64 = 4;
 pub const DATA_HEALTH_VERIFIED: &str = "verified";
 pub const DATA_HEALTH_LEGACY_UNVERIFIED: &str = "legacy_unverified";
 pub const DATA_HEALTH_ACCOUNTING_INCONSISTENT: &str = "accounting_inconsistent";
 pub const DATA_HEALTH_REBUILDING: &str = "rebuilding";
+pub const DATA_HEALTH_SOURCE_INCOMPLETE: &str = "source_incomplete";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -497,18 +498,26 @@ fn rollout_batch_id(account_key: &str, kind: &str) -> String {
     )
 }
 
-fn rollout_rebuild_completed(connection: &Connection, account_key: &str) -> Result<bool, String> {
+fn rollout_rebuild_completed(
+    connection: &Connection,
+    account_key: &str,
+    files: &[PathBuf],
+) -> Result<bool, String> {
     connection
         .query_row(
-            "SELECT 1 FROM account_usage_data_versions
+            "SELECT status FROM account_usage_data_versions
              WHERE account_key = ?1
-               AND rollout_parser_version = ?2
-               AND status != 'rebuilding'",
+               AND rollout_parser_version = ?2",
             params![account_key, ROLLOUT_PARSER_VERSION],
-            |_| Ok(true),
+            |row| row.get::<_, String>(0),
         )
         .optional()
-        .map(|value| value.is_some())
+        .map(|status| {
+            status.is_some_and(|status| {
+                status != DATA_HEALTH_REBUILDING
+                    && !(status == DATA_HEALTH_LEGACY_UNVERIFIED && !files.is_empty())
+            })
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -535,7 +544,7 @@ pub fn account_data_health(
             "SELECT account_key, rollout_parser_version, status, timeline_status,
                     missing_timeline_turns, orphan_timeline_samples,
                     mismatched_turns, parse_error_count, last_rebuild_batch_id,
-                    verified_at
+                    source_incomplete_count, source_lag_seconds, verified_at
              FROM account_usage_data_versions
              WHERE account_key = ?1",
             [account_key],
@@ -550,7 +559,9 @@ pub fn account_data_health(
                     mismatched_turns: row.get(6)?,
                     parse_error_count: row.get(7)?,
                     last_rebuild_batch_id: row.get(8)?,
-                    verified_at: row.get(9)?,
+                    source_incomplete_count: row.get(9)?,
+                    source_lag_seconds: row.get(10)?,
+                    verified_at: row.get(11)?,
                 })
             },
         )
@@ -561,7 +572,7 @@ pub fn account_data_health(
 fn account_health_counts(
     connection: &Connection,
     account_key: &str,
-) -> Result<(i64, i64, i64, i64), String> {
+) -> Result<(i64, i64, i64, i64, i64, i64), String> {
     let missing = connection
         .query_row(
             "SELECT COUNT(*) FROM (
@@ -620,7 +631,101 @@ fn account_health_counts(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    Ok((missing, orphan_samples, mismatched, parse_errors))
+    let (source_incomplete, source_lag_seconds) = source_completeness(connection, account_key)?;
+    Ok((
+        missing,
+        orphan_samples,
+        mismatched,
+        parse_errors,
+        source_incomplete,
+        source_lag_seconds,
+    ))
+}
+
+const SOURCE_LAG_TOLERANCE_SECONDS: i64 = 5 * 60;
+const PENDING_FILE_ACTIVE_WINDOW_SECONDS: i64 = 15 * 60;
+
+fn file_modified_at(path: &str) -> Option<i64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_secs() as i64)
+}
+
+fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i64, i64), String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT file_path, status FROM rollout_file_bindings
+             WHERE account_key = ?1 OR (account_key IS NULL AND status = 'pending')",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([account_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+
+    let now = recorder::now_seconds();
+    let mut incomplete_count = 0;
+    for (path, status) in rows {
+        let Some(metadata) = fs::metadata(&path).ok() else {
+            continue;
+        };
+        let modified_at = file_modified_at(&path);
+        if status == "pending" {
+            if modified_at.is_some_and(|modified| {
+                now.saturating_sub(modified) <= PENDING_FILE_ACTIVE_WINDOW_SECONDS
+            }) {
+                incomplete_count += 1;
+            }
+            continue;
+        }
+        let file_size = metadata.len();
+        let cursor_offset: i64 = connection
+            .query_row(
+                "SELECT byte_offset FROM rollout_cursors WHERE file_path = ?1",
+                [&path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        if file_size > cursor_offset.max(0) as u64 {
+            incomplete_count += 1;
+        }
+    }
+
+    let latest_quota: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(sampled_at) FROM rate_limit_samples WHERE account_key = ?1",
+            [account_key],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let latest_timeline: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(sampled_at) FROM turn_token_samples WHERE account_key = ?1",
+            [account_key],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let source_lag_seconds = match (latest_quota, latest_timeline) {
+        (Some(quota), Some(timeline)) if quota > timeline + SOURCE_LAG_TOLERANCE_SECONDS => {
+            quota - timeline
+        }
+        (Some(quota), None) if incomplete_count > 0 => quota,
+        _ => 0,
+    };
+    if source_lag_seconds > 0 {
+        incomplete_count += 1;
+    }
+    Ok((incomplete_count, source_lag_seconds))
 }
 
 fn set_account_data_health(
@@ -629,7 +734,7 @@ fn set_account_data_health(
     requested_status: &str,
     data_version: i64,
 ) -> Result<AccountDataHealth, String> {
-    let (missing, orphan, mismatched, parse_errors) =
+    let (missing, orphan, mismatched, parse_errors, source_incomplete, source_lag_seconds) =
         account_health_counts(connection, account_key)?;
     let last_rebuild_batch_id: Option<String> = connection
         .query_row(
@@ -644,13 +749,18 @@ fn set_account_data_health(
     let has_accounting_error = orphan > 0 || mismatched > 0 || parse_errors > 0;
     let status = match requested_status {
         DATA_HEALTH_REBUILDING => DATA_HEALTH_REBUILDING,
-        DATA_HEALTH_VERIFIED if missing == 0 && !has_accounting_error => DATA_HEALTH_VERIFIED,
+        DATA_HEALTH_VERIFIED if missing == 0 && !has_accounting_error && source_incomplete == 0 => {
+            DATA_HEALTH_VERIFIED
+        }
         DATA_HEALTH_LEGACY_UNVERIFIED => DATA_HEALTH_LEGACY_UNVERIFIED,
         _ if has_accounting_error || missing > 0 => DATA_HEALTH_ACCOUNTING_INCONSISTENT,
+        _ if source_incomplete > 0 => DATA_HEALTH_SOURCE_INCOMPLETE,
         _ => requested_status,
     };
     let timeline_status = if status == DATA_HEALTH_REBUILDING {
         "rebuilding"
+    } else if source_incomplete > 0 {
+        "source_incomplete"
     } else if parse_errors > 0 {
         "parse_error"
     } else if has_accounting_error {
@@ -667,8 +777,9 @@ fn set_account_data_health(
             "INSERT INTO account_usage_data_versions
              (account_key, rollout_parser_version, status, timeline_status,
               missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
-              parse_error_count, last_rebuild_batch_id, verified_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              parse_error_count, last_rebuild_batch_id, source_incomplete_count,
+              source_lag_seconds, verified_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(account_key) DO UPDATE SET
                rollout_parser_version = excluded.rollout_parser_version,
                status = excluded.status,
@@ -678,6 +789,8 @@ fn set_account_data_health(
                mismatched_turns = excluded.mismatched_turns,
                parse_error_count = excluded.parse_error_count,
                last_rebuild_batch_id = excluded.last_rebuild_batch_id,
+               source_incomplete_count = excluded.source_incomplete_count,
+               source_lag_seconds = excluded.source_lag_seconds,
                verified_at = excluded.verified_at,
                updated_at = excluded.updated_at",
             params![
@@ -690,6 +803,8 @@ fn set_account_data_health(
                 mismatched,
                 parse_errors,
                 last_rebuild_batch_id,
+                source_incomplete,
+                source_lag_seconds,
                 verified_at,
                 now
             ],
@@ -779,7 +894,8 @@ fn audit_timeline_gaps(
     connection
         .execute(
             "DELETE FROM turn_timeline_audits
-             WHERE (?1 IS NULL OR account_key = ?1)",
+             WHERE (?1 IS NULL OR account_key = ?1)
+               AND reason != 'account_unresolved'",
             params![account_key],
         )
         .map_err(|error| error.to_string())?;
@@ -1045,12 +1161,93 @@ fn replace_account_from_staging(
     transaction.commit().map_err(|error| error.to_string())
 }
 
+fn clear_staging_health_records(connection: &Connection) -> Result<(), String> {
+    for table in [
+        "turn_token_samples",
+        "turn_usage",
+        "rollout_parse_errors",
+        "turn_timeline_audits",
+        "account_usage_data_versions",
+        "accounts",
+    ] {
+        connection
+            .execute(
+                &format!("DELETE FROM {table} WHERE account_key LIKE '__rollout_rebuild_v%'"),
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn quarantine_unverified_account_data(
+    connection: &Connection,
+    account_key: &str,
+) -> Result<(), String> {
+    let now = recorder::now_seconds();
+    connection
+        .execute(
+            "INSERT INTO turn_timeline_audits
+             (account_key, thread_id, turn_id, canonical_tokens, timeline_tokens,
+              reason, first_seen_at, last_seen_at)
+             SELECT t.account_key, t.thread_id, t.turn_id, t.raw_total_tokens,
+                    COALESCE(SUM(s.delta_tokens), 0), 'account_unresolved', ?2, ?2
+             FROM turn_usage t
+             LEFT JOIN turn_token_samples s
+               ON s.account_key = t.account_key
+              AND s.thread_id = t.thread_id
+              AND s.turn_id = t.turn_id
+             WHERE t.account_key = ?1
+             GROUP BY t.account_key, t.thread_id, t.turn_id, t.raw_total_tokens
+             ON CONFLICT(account_key, thread_id, turn_id) DO UPDATE SET
+               canonical_tokens = excluded.canonical_tokens,
+               timeline_tokens = excluded.timeline_tokens,
+               reason = 'account_unresolved',
+               last_seen_at = excluded.last_seen_at",
+            params![account_key, now],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM turn_token_samples WHERE account_key = ?1",
+            [account_key],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM turn_usage WHERE account_key = ?1",
+            [account_key],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM quota_intervals WHERE account_key = ?1",
+            [account_key],
+        )
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "DELETE FROM rollout_parse_errors WHERE account_key = ?1",
+            [account_key],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn rebuild_rollout_derived_data(
     connection: &Connection,
     files: &[PathBuf],
     account_key: &str,
 ) -> Result<bool, String> {
-    if rollout_rebuild_completed(connection, account_key)? {
+    clear_staging_health_records(connection)?;
+    let prior_health = account_data_health(connection, account_key)?;
+    if prior_health.as_ref().is_some_and(|health| {
+        health.data_version < ROLLOUT_PARSER_VERSION
+            && health.status != DATA_HEALTH_LEGACY_UNVERIFIED
+    }) {
+        quarantine_unverified_account_data(connection, account_key)?;
+    }
+    if rollout_rebuild_completed(connection, account_key, files)? {
         return Ok(false);
     }
     audit_timeline_gaps(connection, Some(account_key), "legacy_pre_timeline")?;
@@ -1061,7 +1258,7 @@ fn rebuild_rollout_derived_data(
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
-    if files.is_empty() && existing_turns > 0 {
+    if files.is_empty() {
         set_account_data_health(
             connection,
             account_key,
@@ -1165,8 +1362,10 @@ fn refresh_account_health_after_collection(
     match verify_token_accounting(connection, Some(account_key)) {
         Ok(())
             if previous.as_ref().is_some_and(|health| {
-                health.status == DATA_HEALTH_VERIFIED
-                    && health.data_version == ROLLOUT_PARSER_VERSION
+                matches!(
+                    health.status.as_str(),
+                    DATA_HEALTH_VERIFIED | DATA_HEALTH_SOURCE_INCOMPLETE
+                ) && health.data_version == ROLLOUT_PARSER_VERSION
             }) =>
         {
             set_account_data_health(
@@ -1261,16 +1460,53 @@ fn bind_or_quarantine_rollout_file(
         .optional()
         .map_err(|error| error.to_string())?;
     let now = recorder::now_seconds();
+    let modified_at = file_modified_at(&path_string);
     match existing {
         Some((Some(bound_account), status)) if status == "bound" => {
             connection
                 .execute(
-                    "UPDATE rollout_file_bindings SET last_seen_at = ?2
+                    "UPDATE rollout_file_bindings
+                     SET last_seen_at = ?2, last_modified_at = ?3
                      WHERE file_path = ?1",
-                    params![path_string, now],
+                    params![path_string, now, modified_at],
                 )
                 .map_err(|error| error.to_string())?;
             Ok(bound_account == account_key)
+        }
+        Some((None, status)) => {
+            let has_cursor: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM rollout_cursors WHERE file_path = ?1
+                     )",
+                    [&path_string],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if allow_new_binding && !has_cursor && (status == "pending" || status == "quarantined")
+            {
+                connection
+                    .execute(
+                        "UPDATE rollout_file_bindings
+                         SET account_key = ?2, status = 'bound',
+                             reason = 'first_watcher_observation',
+                             last_seen_at = ?3, last_modified_at = ?4
+                         WHERE file_path = ?1",
+                        params![path_string, account_key, now, modified_at],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(true)
+            } else {
+                connection
+                    .execute(
+                        "UPDATE rollout_file_bindings
+                         SET last_seen_at = ?2, last_modified_at = ?3
+                         WHERE file_path = ?1",
+                        params![path_string, now, modified_at],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(false)
+            }
         }
         Some(_) => Ok(false),
         None => {
@@ -1286,13 +1522,26 @@ fn bind_or_quarantine_rollout_file(
                     |row| row.get(0),
                 )
                 .map_err(|error| error.to_string())?;
-            if has_cursor || !allow_new_binding {
+            if has_cursor {
                 connection
                     .execute(
                         "INSERT INTO rollout_file_bindings
-                         (file_path, account_key, status, reason, first_seen_at, last_seen_at)
-                         VALUES (?1, NULL, 'quarantined', 'unattributed_legacy_file', ?2, ?2)",
-                        params![path_string, now],
+                         (file_path, account_key, status, reason, first_seen_at, last_seen_at,
+                          last_modified_at)
+                         VALUES (?1, NULL, 'pending', 'unattributed_legacy_file', ?2, ?2, ?3)",
+                        params![path_string, now, modified_at],
+                    )
+                    .map_err(|error| error.to_string())?;
+                return Ok(false);
+            }
+            if !allow_new_binding {
+                connection
+                    .execute(
+                        "INSERT INTO rollout_file_bindings
+                         (file_path, account_key, status, reason, first_seen_at, last_seen_at,
+                          last_modified_at)
+                         VALUES (?1, NULL, 'pending', 'awaiting_watcher_binding', ?2, ?2, ?3)",
+                        params![path_string, now, modified_at],
                     )
                     .map_err(|error| error.to_string())?;
                 return Ok(false);
@@ -1300,9 +1549,10 @@ fn bind_or_quarantine_rollout_file(
             connection
                 .execute(
                     "INSERT INTO rollout_file_bindings
-                     (file_path, account_key, status, reason, first_seen_at, last_seen_at)
-                     VALUES (?1, ?2, 'bound', 'first_observed_for_account', ?3, ?3)",
-                    params![path_string, account_key, now],
+                     (file_path, account_key, status, reason, first_seen_at, last_seen_at,
+                      last_modified_at)
+                     VALUES (?1, ?2, 'bound', 'first_observed_for_account', ?3, ?3, ?4)",
+                    params![path_string, account_key, now, modified_at],
                 )
                 .map_err(|error| error.to_string())?;
             Ok(true)
@@ -1746,6 +1996,17 @@ mod tests {
             )
             .unwrap();
 
+        assert!(!bind_or_quarantine_rollout_file(&connection, &first, "account-a", false).unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM rollout_file_bindings WHERE file_path = ?1",
+                    [first.to_string_lossy().as_ref()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "pending"
+        );
         assert!(bind_or_quarantine_rollout_file(&connection, &first, "account-a", true).unwrap());
         assert!(!bind_or_quarantine_rollout_file(&connection, &first, "account-b", true).unwrap());
         assert!(bind_or_quarantine_rollout_file(&connection, &second, "account-b", true).unwrap());
@@ -1766,7 +2027,7 @@ mod tests {
         assert_eq!(bindings[0].1.as_deref(), Some("account-a"));
         assert_eq!(bindings[0].2, "bound");
         assert_eq!(bindings[2].1, None);
-        assert_eq!(bindings[2].2, "quarantined");
+        assert_eq!(bindings[2].2, "pending");
         fs::remove_file(first).unwrap();
         fs::remove_file(second).unwrap();
         fs::remove_file(cursored).unwrap();
@@ -1796,6 +2057,55 @@ mod tests {
             health.last_rebuild_batch_id.as_deref(),
             Some("rebuild-batch-a")
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unconsumed_bound_rollout_bytes_make_verified_health_source_incomplete() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "codex-nexus-source-gap-{}-{}.jsonl",
+            std::process::id(),
+            recorder::now_seconds()
+        ));
+        fs::write(&path, "pending content\n").unwrap();
+        assert!(bind_or_quarantine_rollout_file(&connection, &path, "account-a", true).unwrap());
+        connection
+            .execute(
+                "INSERT INTO rollout_cursors
+                 (file_path, byte_offset, last_scanned_at, state_json)
+                 VALUES (?1, 0, 1, '{}')",
+                [path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let health = set_account_data_health(
+            &connection,
+            "account-a",
+            DATA_HEALTH_VERIFIED,
+            ROLLOUT_PARSER_VERSION,
+        )
+        .unwrap();
+        assert_eq!(health.status, DATA_HEALTH_SOURCE_INCOMPLETE);
+        assert_eq!(health.source_incomplete_count, 1);
+
+        connection
+            .execute(
+                "UPDATE rollout_cursors SET byte_offset = ?2 WHERE file_path = ?1",
+                params![
+                    path.to_string_lossy().as_ref(),
+                    fs::metadata(&path).unwrap().len() as i64
+                ],
+            )
+            .unwrap();
+        let health = set_account_data_health(
+            &connection,
+            "account-a",
+            DATA_HEALTH_VERIFIED,
+            ROLLOUT_PARSER_VERSION,
+        )
+        .unwrap();
+        assert_eq!(health.status, DATA_HEALTH_VERIFIED);
         fs::remove_file(path).unwrap();
     }
 
@@ -1922,6 +2232,73 @@ mod tests {
         assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "verified-b").unwrap());
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v4_migration_quarantines_previously_verified_unattributed_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_usage
+                 (account_key, thread_id, turn_id, started_at, reasoning_effort,
+                  speed_mode, raw_total_tokens, source, confidence, created_at, updated_at)
+                 VALUES ('a', 'thread', 'polluted', 1, 'high', 'standard',
+                         100, 'rollout', 'high', 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, segment_no, reasoning_effort,
+                  speed_mode, sampled_at, cumulative_tokens, delta_tokens,
+                  source, confidence)
+                 VALUES ('a', 'thread', 'polluted', 0, 'high', 'standard',
+                         2, 100, 100, 'rollout', 'high')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_usage_data_versions
+                 (account_key, rollout_parser_version, status, timeline_status,
+                  missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+                  parse_error_count, source_incomplete_count, source_lag_seconds,
+                  updated_at)
+                 VALUES ('a', 3, 'verified', 'complete', 0, 0, 0, 0, 0, 0, 1)
+                 ON CONFLICT(account_key) DO UPDATE SET
+                   rollout_parser_version = 3, status = 'verified',
+                   timeline_status = 'complete', updated_at = 1",
+                [],
+            )
+            .unwrap();
+
+        assert!(!rebuild_rollout_derived_data(&connection, &[], "a").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM turn_usage WHERE account_key = 'a'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT reason FROM turn_timeline_audits
+                     WHERE account_key = 'a' AND turn_id = 'polluted'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "account_unresolved"
+        );
+        let health = account_data_health(&connection, "a").unwrap().unwrap();
+        assert_eq!(health.data_version, ROLLOUT_PARSER_VERSION);
+        assert_eq!(health.status, DATA_HEALTH_LEGACY_UNVERIFIED);
     }
 
     #[test]

@@ -243,13 +243,15 @@ export interface CategoryUsageQuotaWindow {
 export interface AccountDataHealth {
   accountKey: string;
   dataVersion: number;
-  status: "verified" | "legacy_unverified" | "accounting_inconsistent" | "rebuilding";
+  status: "verified" | "legacy_unverified" | "accounting_inconsistent" | "rebuilding" | "source_incomplete";
   timelineStatus: string;
   missingTimelineTurns: number;
   orphanTimelineSamples: number;
   mismatchedTurns: number;
   parseErrorCount: number;
   lastRebuildBatchId: string | null;
+  sourceIncompleteCount: number;
+  sourceLagSeconds: number;
   verifiedAt: number | null;
 }
 

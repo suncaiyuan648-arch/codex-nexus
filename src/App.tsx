@@ -82,6 +82,8 @@ function estimatorReasonLabel(value: string): string {
       return "历史数据尚未验证";
     case "account_data_rebuilding":
       return "账号数据正在重建";
+    case "source_incomplete":
+      return "Token 采集尚未追平";
     case "boundary_overlap":
       return "boundary overlap 太多";
     case "boundary_ambiguity":
@@ -256,7 +258,7 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
 
       {usage?.dataHealth && usage.dataHealth.status !== "verified" ? (
         <p className="quota-estimate-warning">
-          当前账号数据状态为 {usage.dataHealth.status}，估算已暂停；缺失 Timeline {usage.dataHealth.missingTimelineTurns} 条、孤立 Timeline {usage.dataHealth.orphanTimelineSamples} 条、解析错误 {usage.dataHealth.parseErrorCount} 条。
+          当前账号数据状态为 {usage.dataHealth.status}，估算已暂停；未追平数据源 {usage.dataHealth.sourceIncompleteCount} 个、source lag {usage.dataHealth.sourceLagSeconds} 秒，缺失 Timeline {usage.dataHealth.missingTimelineTurns} 条、孤立 Timeline {usage.dataHealth.orphanTimelineSamples} 条、解析错误 {usage.dataHealth.parseErrorCount} 条。
         </p>
       ) : null}
 

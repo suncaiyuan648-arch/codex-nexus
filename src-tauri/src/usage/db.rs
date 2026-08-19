@@ -75,13 +75,17 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 mismatched_turns INTEGER NOT NULL DEFAULT 0,
                 parse_error_count INTEGER NOT NULL DEFAULT 0,
                 last_rebuild_batch_id TEXT,
+                source_incomplete_count INTEGER NOT NULL DEFAULT 0,
+                source_lag_seconds INTEGER NOT NULL DEFAULT 0,
                 verified_at INTEGER,
                 updated_at INTEGER NOT NULL,
                 CHECK (rollout_parser_version >= 0),
                 CHECK (missing_timeline_turns >= 0),
                 CHECK (orphan_timeline_samples >= 0),
                 CHECK (mismatched_turns >= 0),
-                CHECK (parse_error_count >= 0)
+                CHECK (parse_error_count >= 0),
+                CHECK (source_incomplete_count >= 0),
+                CHECK (source_lag_seconds >= 0)
             );
 
             CREATE TABLE IF NOT EXISTS turn_timeline_audits (
@@ -113,7 +117,8 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 reason TEXT,
                 first_seen_at INTEGER NOT NULL,
                 last_seen_at INTEGER NOT NULL,
-                CHECK (status IN ('bound', 'quarantined'))
+                last_modified_at INTEGER,
+                CHECK (status IN ('bound', 'pending', 'quarantined'))
             );
 
             CREATE TABLE IF NOT EXISTS turn_usage (
@@ -280,8 +285,19 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
             "last_rebuild_batch_id",
             "TEXT",
         ),
+        (
+            "account_usage_data_versions",
+            "source_incomplete_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "account_usage_data_versions",
+            "source_lag_seconds",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
         ("rollout_parse_errors", "account_key", "TEXT"),
         ("rollout_parse_errors", "rebuild_batch_id", "TEXT"),
+        ("rollout_file_bindings", "last_modified_at", "INTEGER"),
     ] {
         if table_exists(connection, table)? && !has_column(connection, table, column)? {
             connection
@@ -298,6 +314,7 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
              ON rollout_parse_errors(account_key, rebuild_batch_id);",
         )
         .map_err(|error| error.to_string())?;
+    migrate_rollout_file_binding_status(connection)?;
 
     // Existing account-bound rows predate account-scoped parser versions.
     // Register them as legacy without overwriting a status established by a
@@ -362,6 +379,55 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
         .optional()
         .map(|value| value.is_some())
         .map_err(|error| error.to_string())
+}
+
+fn migrate_rollout_file_binding_status(connection: &Connection) -> Result<(), String> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'rollout_file_bindings'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("'pending'") {
+        return Ok(());
+    }
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(
+            "
+            ALTER TABLE rollout_file_bindings RENAME TO rollout_file_bindings_legacy;
+            CREATE TABLE rollout_file_bindings (
+                file_path TEXT PRIMARY KEY,
+                account_key TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                last_modified_at INTEGER,
+                CHECK (status IN ('bound', 'pending', 'quarantined'))
+            );
+            INSERT INTO rollout_file_bindings
+              (file_path, account_key, status, reason, first_seen_at, last_seen_at)
+            SELECT file_path, account_key,
+                   CASE WHEN status = 'quarantined' AND account_key IS NULL
+                        THEN 'pending' ELSE status END,
+                   CASE WHEN status = 'quarantined' AND account_key IS NULL
+                        THEN 'legacy_quarantine_pending' ELSE reason END,
+                   first_seen_at, last_seen_at
+            FROM rollout_file_bindings_legacy;
+            DROP TABLE rollout_file_bindings_legacy;
+            ",
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())
 }
 
 fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, String> {
@@ -787,5 +853,38 @@ mod tests {
                 .unwrap(),
             "invalid json"
         );
+    }
+
+    #[test]
+    fn migrates_old_quarantine_bindings_to_watcher_pending() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE rollout_file_bindings (
+                  file_path TEXT PRIMARY KEY,
+                  account_key TEXT,
+                  status TEXT NOT NULL,
+                  reason TEXT,
+                  first_seen_at INTEGER NOT NULL,
+                  last_seen_at INTEGER NOT NULL,
+                  CHECK (status IN ('bound', 'quarantined'))
+                );
+                INSERT INTO rollout_file_bindings
+                  VALUES ('/tmp/old.jsonl', NULL, 'quarantined',
+                          'unattributed_legacy_file', 1, 1);
+                ",
+            )
+            .unwrap();
+        initialize_schema(&connection).unwrap();
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM rollout_file_bindings
+                 WHERE file_path = '/tmp/old.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
     }
 }

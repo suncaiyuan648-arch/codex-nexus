@@ -39,6 +39,8 @@ pub struct AccountDataHealth {
     pub mismatched_turns: i64,
     pub parse_error_count: i64,
     pub last_rebuild_batch_id: Option<String>,
+    pub source_incomplete_count: i64,
+    pub source_lag_seconds: i64,
     pub verified_at: Option<i64>,
 }
 

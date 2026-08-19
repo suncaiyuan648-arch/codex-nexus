@@ -205,7 +205,9 @@ fn add_rejection_reason(value: &mut CategoryEstimateAccumulator, reason: &str) {
         | "boundary_ambiguity"
         | "pending_tokens"
         | "external_usage_risk"
-        | "pre_observation_tokens" => &mut value.warnings,
+        | "pre_observation_tokens"
+        | "source_gap"
+        | "mixed_category_unresolved" => &mut value.warnings,
         _ => &mut value.hard_blockers,
     };
     if !destination.iter().any(|item| item == reason) {
@@ -406,6 +408,9 @@ fn estimate_weekly_categories(
             Some(health) if health.status == rollout::DATA_HEALTH_ACCOUNTING_INCONSISTENT => {
                 Some("accounting_inconsistent")
             }
+            Some(health) if health.status == rollout::DATA_HEALTH_SOURCE_INCOMPLETE => {
+                Some("source_incomplete")
+            }
             _ => Some("legacy_unverified"),
         },
         None => Some("legacy_unverified"),
@@ -425,9 +430,6 @@ fn estimate_weekly_categories(
         .unwrap_or_default();
     let observation_horizon = steps.first().map(|step| step.start_at).unwrap_or(end);
     for step in &steps {
-        for value in accumulators.values_mut() {
-            value.observed_sample_count += 1;
-        }
         let mut categories_in_step = BTreeSet::new();
         let mut valid_tokens_by_category: BTreeMap<CategoryKey, i64> = BTreeMap::new();
         let mut boundary_categories = BTreeSet::new();
@@ -459,6 +461,20 @@ fn estimate_weekly_categories(
             *entry = entry.saturating_add(sample_tokens);
         }
 
+        if categories_in_step.is_empty() {
+            // A quota transition with no local Token sample is a source gap,
+            // not evidence that every category has too few observations.
+            for value in accumulators.values_mut() {
+                add_rejection_reason(value, "source_gap");
+            }
+            continue;
+        }
+        for key in &categories_in_step {
+            if let Some(accumulator) = accumulators.get_mut(key) {
+                accumulator.observed_sample_count += 1;
+            }
+        }
+
         for key in &boundary_categories {
             if let Some(accumulator) = accumulators.get_mut(key) {
                 accumulator.boundary_overlap_count += 1;
@@ -482,17 +498,15 @@ fn estimate_weekly_categories(
                     }
                 }
             }
-            for value in accumulators.values_mut() {
-                value.rejected_sample_count += 1;
-                add_rejection_reason(
-                    value,
-                    if categories_in_step.is_empty() {
-                        "insufficient_samples"
-                    } else {
-                        "mixed_category_unresolved"
-                    },
-                );
+            for key in &categories_in_step {
+                if let Some(value) = accumulators.get_mut(key) {
+                    value.rejected_sample_count += 1;
+                    add_rejection_reason(value, "mixed_category_unresolved");
+                }
             }
+            // Mixed steps are excluded from every involved category's
+            // evidence, but remain warnings. A single mixed step must not
+            // erase otherwise valid pure-category observations.
             continue;
         }
 
@@ -546,7 +560,10 @@ fn estimate_weekly_categories(
             let current_tokens = total_category_tokens;
             let raw_eligible_tokens =
                 current_tokens - value.pre_observation_tokens - value.pending_tokens;
-            let eligible_tokens = raw_eligible_tokens.max(0);
+            let eligible_tokens = raw_eligible_tokens
+                .saturating_sub(value.excluded_tokens)
+                .saturating_sub(value.ambiguous_boundary_tokens)
+                .max(0);
             let coverage_ratio = if eligible_tokens > 0 {
                 value.observed_tokens as f64 / eligible_tokens as f64
             } else if value.observed_tokens > 0 {
@@ -571,7 +588,7 @@ fn estimate_weekly_categories(
             if raw_eligible_tokens < 0
                 || value.observed_tokens > eligible_tokens
                 || eligible_tokens > total_category_tokens
-                || value.candidate_tokens > eligible_tokens
+                || value.candidate_tokens > raw_eligible_tokens
                 || accounted_step_tokens != value.candidate_tokens
             {
                 add_rejection_reason(&mut value, "accounting_inconsistent");
@@ -685,8 +702,12 @@ fn insufficient_estimate(
     ambiguous_boundary_ratio: f64,
     source: &str,
 ) -> CategoryTokenEstimate {
-    let eligible_tokens =
-        (value.current_tokens - value.pre_observation_tokens - value.pending_tokens).max(0);
+    let eligible_tokens = (value.current_tokens
+        - value.pre_observation_tokens
+        - value.pending_tokens
+        - value.excluded_tokens
+        - value.ambiguous_boundary_tokens)
+        .max(0);
     let hard_blockers = value.hard_blockers.clone();
     let warnings = value.warnings.clone();
     let rejection_reasons = diagnostic_reasons(&value);
@@ -1588,6 +1609,93 @@ mod tests {
                 .iter()
                 .any(|reason| reason == "mixed_category_unresolved"));
         }
+    }
+
+    #[test]
+    fn one_mixed_step_does_not_block_categories_with_five_pure_steps() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        for timestamp in 1000..=9000 {
+            if timestamp % 1000 != 0 {
+                continue;
+            }
+            connection
+                .execute(
+                    "INSERT INTO rate_limit_samples
+                     (account_key, sampled_at, limit_id, window, window_duration_mins,
+                      used_percent, resets_at, source, confidence)
+                     VALUES ('a', ?1, 'weekly', 'primary', 10080, ?2, 20000,
+                             'account_rate_limit', 'high')",
+                    params![timestamp, 10.0 + (timestamp / 1000) as f64],
+                )
+                .unwrap();
+        }
+        for (index, sampled_at) in [2500, 3500, 4500, 5500, 6500].into_iter().enumerate() {
+            insert_timeline_sample(
+                &connection,
+                &format!("pure-{index}"),
+                "gpt-5.6-luna",
+                sampled_at,
+                2_000,
+                2_000,
+            );
+        }
+        insert_timeline_sample(
+            &connection,
+            "mixed-luna",
+            "gpt-5.6-luna",
+            7500,
+            2_000,
+            2_000,
+        );
+        insert_timeline_sample(&connection, "mixed-sol", "gpt-5.6-sol", 7500, 1_000, 1_000);
+        quota::refresh_intervals(&connection, "a", "weekly", "primary").unwrap();
+
+        let mut categories = BTreeMap::new();
+        categories.insert(
+            ("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()),
+            LocalAggregate {
+                tokens: 12_000,
+                turn_count: 6,
+            },
+        );
+        categories.insert(
+            ("gpt-5.6-sol".into(), "xhigh".into(), "standard".into()),
+            LocalAggregate {
+                tokens: 1_000,
+                turn_count: 1,
+            },
+        );
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 18.0,
+            remaining_percent: 82.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimates = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10_000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap();
+        let luna = estimates
+            .get(&("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()))
+            .unwrap();
+        assert_eq!(luna.valid_sample_count, 5);
+        assert_eq!(luna.status, USAGE_STATUS_ESTIMATED);
+        assert!(!luna
+            .hard_blockers
+            .iter()
+            .any(|reason| reason == "mixed_category_unresolved"));
+        assert!(luna
+            .warnings
+            .iter()
+            .any(|reason| reason == "mixed_category_unresolved"));
     }
 
     #[test]
