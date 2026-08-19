@@ -143,11 +143,58 @@ fn upsert_turn(connection: &Connection, turn: &TurnUsageRecord) -> Result<(), St
     Ok(())
 }
 
+fn insert_token_sample(
+    connection: &Connection,
+    account_key: &str,
+    thread_id: &str,
+    turn_id: &str,
+    model: Option<&str>,
+    reasoning_effort: &str,
+    speed_mode: &str,
+    sampled_at: i64,
+    cumulative_tokens: i64,
+    delta_tokens: i64,
+    confidence: &Confidence,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO turn_token_samples
+             (account_key, thread_id, turn_id, model, reasoning_effort, speed_mode,
+              sampled_at, cumulative_tokens, delta_tokens, source, confidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                account_key,
+                thread_id,
+                turn_id,
+                model,
+                reasoning_effort,
+                speed_mode,
+                sampled_at,
+                cumulative_tokens,
+                delta_tokens,
+                SOURCE_ROLLOUT,
+                recorder::confidence_string(confidence),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn process_line(
     connection: &Connection,
     line: &str,
     state: &mut CursorState,
     account_key: &str,
+) -> Result<bool, String> {
+    process_line_inner(connection, line, state, account_key, true)
+}
+
+fn process_line_inner(
+    connection: &Connection,
+    line: &str,
+    state: &mut CursorState,
+    account_key: &str,
+    persist_turn: bool,
 ) -> Result<bool, String> {
     let value: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
     let timestamp = parse_timestamp(value.get("timestamp")).unwrap_or_else(recorder::now_seconds);
@@ -191,6 +238,11 @@ fn process_line(
                 .map(parse_usage)
                 .unwrap_or_default();
             let reset_baseline = total.raw_total_tokens < state.last_totals.raw_total_tokens;
+            let previous_turn_tokens = if reset_baseline {
+                0
+            } else {
+                subtract(&state.last_totals, &state.turn_start_totals).raw_total_tokens
+            };
             if reset_baseline {
                 state.turn_start_totals = TokenUsage::default();
             }
@@ -206,6 +258,8 @@ fn process_line(
                     state.last_totals.clone()
                 };
             let usage = subtract(&effective_total, &state.turn_start_totals);
+            let delta_tokens = (usage.raw_total_tokens - previous_turn_tokens).max(0);
+            let cumulative_tokens = usage.raw_total_tokens;
             state.last_totals = effective_total;
 
             let thread_id = state
@@ -219,8 +273,13 @@ fn process_line(
                 .unwrap_or_else(|| format!("unknown:{timestamp}"));
             let speed = state.speed_mode.clone().unwrap_or_else(|| "unknown".into());
             let model = state.model.clone();
+            let reasoning_effort = state
+                .reasoning_effort
+                .clone()
+                .unwrap_or_else(|| "unknown".into());
             let card = RateCard::current();
             let estimated_credits = card.calculate(model.as_deref(), &speed, &usage);
+            let sample_confidence = confidence(model.as_deref(), &reasoning_effort, &speed);
             let turn = TurnUsageRecord {
                 account_key: account_key.into(),
                 thread_id,
@@ -228,24 +287,34 @@ fn process_line(
                 started_at: state.turn_started_at.unwrap_or(timestamp),
                 completed_at: Some(timestamp),
                 model: model.clone(),
-                reasoning_effort: state
-                    .reasoning_effort
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into()),
+                reasoning_effort: reasoning_effort.clone(),
                 speed_mode: speed.clone(),
                 usage,
                 estimated_credits,
                 rate_card_version: estimated_credits
                     .map(|_| super::rate_card::CURRENT_RATE_CARD_VERSION.into()),
                 source: SOURCE_ROLLOUT.into(),
-                confidence: confidence(
-                    model.as_deref(),
-                    state.reasoning_effort.as_deref().unwrap_or("unknown"),
-                    &speed,
-                ),
+                confidence: sample_confidence.clone(),
             };
-            recorder::ensure_account(connection, account_key, timestamp)?;
-            upsert_turn(connection, &turn)?;
+            if persist_turn {
+                recorder::ensure_account(connection, account_key, timestamp)?;
+                upsert_turn(connection, &turn)?;
+            }
+            if delta_tokens > 0 {
+                insert_token_sample(
+                    connection,
+                    account_key,
+                    &turn.thread_id,
+                    &turn.turn_id,
+                    model.as_deref(),
+                    &reasoning_effort,
+                    &speed,
+                    timestamp,
+                    cumulative_tokens,
+                    delta_tokens,
+                    &sample_confidence,
+                )?;
+            }
             Ok(true)
         }
         _ => Ok(false),
@@ -358,6 +427,75 @@ fn collect_one(connection: &Connection, path: &Path, account_key: &str) -> Resul
     Ok(changed)
 }
 
+fn collect_timeline_from_file(
+    connection: &Connection,
+    path: &Path,
+    account_key: &str,
+) -> Result<(), String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut state = CursorState::default();
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            break;
+        }
+        if let Err(error) = process_line_inner(
+            &transaction,
+            line.trim_end(),
+            &mut state,
+            account_key,
+            false,
+        ) {
+            eprintln!(
+                "[Usage] ignored timeline backfill line in {}: {error}",
+                path.display()
+            );
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())
+}
+
+fn timeline_backfill_name(account_key: &str) -> String {
+    format!("turn_token_samples_v1:{account_key}")
+}
+
+fn timeline_backfill_completed(connection: &Connection, account_key: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT 1 FROM usage_migrations WHERE name = ?1",
+            [timeline_backfill_name(account_key)],
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(|error| error.to_string())
+}
+
+fn mark_timeline_backfill_completed(
+    connection: &Connection,
+    account_key: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO usage_migrations (name, completed_at)
+             VALUES (?1, ?2)",
+            params![timeline_backfill_name(account_key), recorder::now_seconds()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -430,6 +568,21 @@ pub fn collect_rollouts(app: &tauri::AppHandle<tauri::Wry>) -> Result<bool, Stri
         discover(&root, &mut files);
     }
     files.sort();
+    if !timeline_backfill_completed(&connection, &account_key)? {
+        let mut backfill_ok = true;
+        for path in &files {
+            if let Err(error) = collect_timeline_from_file(&connection, path, &account_key) {
+                backfill_ok = false;
+                eprintln!(
+                    "[Usage] token timeline backfill failed for {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        if backfill_ok {
+            mark_timeline_backfill_completed(&connection, &account_key)?;
+        }
+    }
     let mut changed = false;
     for path in files {
         match collect_one(&connection, &path, &account_key) {
@@ -474,6 +627,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(total, 135);
+        let samples: Vec<(i64, i64)> = connection
+            .prepare(
+                "SELECT cumulative_tokens, delta_tokens
+                 FROM turn_token_samples ORDER BY cumulative_tokens",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(samples, vec![(100, 100), (135, 35)]);
     }
 
     #[test]
@@ -496,6 +660,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(total, 100);
+        let sample_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM turn_token_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sample_count, 1);
     }
 
     #[test]
@@ -532,5 +702,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(total, 100);
+        let sample_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM turn_token_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sample_count, 1);
     }
 }

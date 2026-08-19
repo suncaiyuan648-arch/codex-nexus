@@ -138,6 +138,48 @@ fn local_category_usage(
         entry.turn_count += 1;
         total = total.saturating_add(tokens.max(0));
     }
+
+    // A turn can start before the requested period and continue producing
+    // tokens inside it. Its final turn total cannot place those tokens on the
+    // period timeline, so add only timeline deltas belonging to turns that
+    // started before the period. Turns that started inside the period remain
+    // represented by their canonical turn total above, avoiding double count.
+    let mut statement = connection
+        .prepare(
+            "SELECT s.model, s.reasoning_effort, s.speed_mode,
+                    SUM(s.delta_tokens), COUNT(DISTINCT s.thread_id || ':' || s.turn_id)
+             FROM turn_token_samples s
+             LEFT JOIN turn_usage t
+               ON t.account_key = s.account_key
+              AND t.thread_id = s.thread_id
+              AND t.turn_id = s.turn_id
+             WHERE s.account_key = ?1
+               AND s.sampled_at >= ?2 AND s.sampled_at < ?3
+               AND (t.started_at IS NULL OR t.started_at < ?2)
+             GROUP BY s.model, s.reasoning_effort, s.speed_mode",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map(params![account_key, start, end], |row| {
+            Ok((
+                (
+                    row.get::<_, Option<String>>(0)?
+                        .unwrap_or_else(|| "unknown".into()),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ),
+                row.get::<_, Option<i64>>(3)?.unwrap_or_default().max(0),
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        let (key, tokens, turn_count) = row.map_err(|error| error.to_string())?;
+        let entry = categories.entry(key).or_default();
+        entry.tokens = entry.tokens.saturating_add(tokens);
+        entry.turn_count += turn_count;
+        total = total.saturating_add(tokens);
+    }
     Ok((categories, total))
 }
 
@@ -155,16 +197,34 @@ struct QuotaStep {
     observed_delta_percent: f64,
 }
 
+#[derive(Clone, Debug)]
+struct TokenDeltaSample {
+    key: CategoryKey,
+    turn_started_at: Option<i64>,
+    sampled_at: i64,
+    delta_tokens: i64,
+    previous_sampled_at: Option<i64>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct CategoryEstimateAccumulator {
+    current_tokens: i64,
     observed_sample_count: i64,
     valid_sample_count: i64,
     observed_tokens: i64,
     observed_quota_percent: f64,
+    pre_observation_tokens: i64,
     pending_tokens: i64,
     rejected_sample_count: i64,
     boundary_overlap_count: i64,
-    rates: Vec<f64>,
+    rates: Vec<(f64, f64)>,
+    rejection_reasons: Vec<String>,
+}
+
+fn add_rejection_reason(value: &mut CategoryEstimateAccumulator, reason: &str) {
+    if !value.rejection_reasons.iter().any(|item| item == reason) {
+        value.rejection_reasons.push(reason.into());
+    }
 }
 
 fn quota_steps(
@@ -201,66 +261,64 @@ fn quota_steps(
         .collect()
 }
 
-fn interval_category_usage(
+fn timeline_token_samples(
     connection: &Connection,
     account_key: &str,
     start: i64,
     end: i64,
-) -> Result<(BTreeMap<CategoryKey, LocalAggregate>, i64), String> {
+) -> Result<Vec<TokenDeltaSample>, String> {
     let mut statement = connection
         .prepare(
-            "SELECT COALESCE(model, 'unknown'), reasoning_effort, speed_mode,
-                    raw_total_tokens
-             FROM turn_usage
-             WHERE account_key = ?1 AND started_at > ?2 AND started_at <= ?3",
+            "SELECT s.thread_id, s.turn_id, COALESCE(s.model, 'unknown'),
+                    s.reasoning_effort, s.speed_mode, s.sampled_at, s.delta_tokens,
+                    t.started_at
+             FROM turn_token_samples
+             s LEFT JOIN turn_usage t
+               ON t.account_key = s.account_key
+              AND t.thread_id = s.thread_id
+              AND t.turn_id = s.turn_id
+             WHERE s.account_key = ?1
+               AND s.sampled_at >= ?2 AND s.sampled_at <= ?3
+             ORDER BY s.thread_id, s.turn_id, s.sampled_at, s.id",
         )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map(params![account_key, start, end], |row| {
-            Ok((
-                (
+        .query_map(
+            params![account_key, start.saturating_sub(7 * 24 * 60 * 60), end],
+            |row| {
+                Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ),
-                row.get::<_, i64>(3)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?;
-    let mut categories: BTreeMap<CategoryKey, LocalAggregate> = BTreeMap::new();
-    let mut total: i64 = 0;
-    for row in rows {
-        let (key, tokens) = row.map_err(|error| error.to_string())?;
-        let tokens = tokens.max(0);
-        let entry = categories.entry(key).or_default();
-        entry.tokens = entry.tokens.saturating_add(tokens);
-        entry.turn_count += 1;
-        total = total.saturating_add(tokens);
-    }
-    Ok((categories, total))
-}
-
-fn has_boundary_overlap(
-    connection: &Connection,
-    account_key: &str,
-    start: i64,
-    end: i64,
-) -> Result<bool, String> {
-    connection
-        .query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM turn_usage
-               WHERE account_key = ?1
-                 AND (
-                   (started_at < ?2 AND COALESCE(completed_at, ?3 + 1) > ?2)
-                   OR
-                   (started_at < ?3 AND COALESCE(completed_at, ?3 + 1) > ?3)
-                 )
-             )",
-            params![account_key, start, end],
-            |row| row.get(0),
+                    (
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ),
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let mut previous_by_turn: HashMap<(String, String), i64> = HashMap::new();
+    let mut samples = Vec::new();
+    for row in rows {
+        let (thread_id, turn_id, key, sampled_at, delta_tokens, turn_started_at) =
+            row.map_err(|error| error.to_string())?;
+        let turn_key = (thread_id.clone(), turn_id.clone());
+        let previous_sampled_at = previous_by_turn.insert(turn_key, sampled_at);
+        if sampled_at > start && sampled_at <= end && delta_tokens > 0 {
+            samples.push(TokenDeltaSample {
+                key,
+                turn_started_at,
+                sampled_at,
+                delta_tokens,
+                previous_sampled_at,
+            });
+        }
+    }
+    Ok(samples)
 }
 
 fn median(values: &[f64]) -> Option<f64> {
@@ -284,6 +342,27 @@ fn median_absolute_deviation(values: &[f64], center: f64) -> f64 {
     median(&deviations).unwrap_or(0.0)
 }
 
+fn weighted_median(values: &[(f64, f64)]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let total_weight: f64 = sorted.iter().map(|(_, weight)| weight.max(0.0)).sum();
+    if total_weight <= 0.0 {
+        return median(&sorted.iter().map(|(value, _)| *value).collect::<Vec<_>>());
+    }
+    let midpoint = total_weight / 2.0;
+    let mut accumulated = 0.0;
+    for (value, weight) in sorted {
+        accumulated += weight.max(0.0);
+        if accumulated >= midpoint {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn estimate_weekly_categories(
     connection: &Connection,
     account_key: Option<&str>,
@@ -301,13 +380,23 @@ fn estimate_weekly_categories(
     let mut accumulators: BTreeMap<CategoryKey, CategoryEstimateAccumulator> = categories
         .keys()
         .cloned()
-        .map(|key| (key, CategoryEstimateAccumulator::default()))
+        .map(|key| {
+            let current_tokens = categories.get(&key).map(|item| item.tokens).unwrap_or(0);
+            (
+                key,
+                CategoryEstimateAccumulator {
+                    current_tokens,
+                    ..CategoryEstimateAccumulator::default()
+                },
+            )
+        })
         .collect();
 
     let Some(quota_window) = quota_window else {
         return Ok(accumulators
             .into_iter()
-            .map(|(key, value)| {
+            .map(|(key, mut value)| {
+                add_rejection_reason(&mut value, "quota_window_missing");
                 (
                     key,
                     insufficient_estimate(value, 0.0, 0.0, PROVENANCE_DERIVED_ESTIMATE),
@@ -324,91 +413,190 @@ fn estimate_weekly_categories(
         start,
         end,
     )?;
-    let mut last_closed_step_end = None;
+    let timeline_samples = account_key
+        .map(|account_key| timeline_token_samples(connection, account_key, start, end))
+        .transpose()?
+        .unwrap_or_default();
+    let observation_horizon = steps.first().map(|step| step.start_at).unwrap_or(end);
+    if let Some(account_key) = account_key {
+        let mut statement = connection
+            .prepare(
+                "SELECT COALESCE(model, 'unknown'), reasoning_effort, speed_mode,
+                        SUM(raw_total_tokens)
+                 FROM turn_usage
+                 WHERE account_key = ?1
+                   AND started_at >= ?2 AND started_at < ?3
+                 GROUP BY model, reasoning_effort, speed_mode",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![account_key, start, observation_horizon], |row| {
+                Ok((
+                    (
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ),
+                    row.get::<_, Option<i64>>(3)?.unwrap_or_default().max(0),
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (key, tokens) = row.map_err(|error| error.to_string())?;
+            if let Some(accumulator) = accumulators.get_mut(&key) {
+                accumulator.pre_observation_tokens =
+                    accumulator.pre_observation_tokens.saturating_add(tokens);
+            }
+        }
+    }
     for step in &steps {
-        last_closed_step_end = Some(step.end_at);
         for value in accumulators.values_mut() {
             value.observed_sample_count += 1;
         }
-        let Some(account_key) = account_key else {
-            continue;
-        };
-        let (interval_categories, _) =
-            interval_category_usage(connection, account_key, step.start_at, step.end_at)?;
-        let boundary_overlap =
-            has_boundary_overlap(connection, account_key, step.start_at, step.end_at)?;
-        if boundary_overlap {
+        let mut categories_in_step = BTreeSet::new();
+        let mut valid_tokens_by_category: BTreeMap<CategoryKey, i64> = BTreeMap::new();
+        let mut boundary_categories = BTreeSet::new();
+        for sample in timeline_samples
+            .iter()
+            .filter(|sample| sample.sampled_at > step.start_at && sample.sampled_at <= step.end_at)
+        {
+            categories_in_step.insert(sample.key.clone());
+            let crosses_step_start = sample
+                .previous_sampled_at
+                .is_some_and(|previous| previous < step.start_at);
+            if crosses_step_start {
+                boundary_categories.insert(sample.key.clone());
+                continue;
+            }
+            let entry = valid_tokens_by_category
+                .entry(sample.key.clone())
+                .or_default();
+            *entry = entry.saturating_add(sample.delta_tokens.max(0));
+        }
+
+        for key in &boundary_categories {
+            if let Some(accumulator) = accumulators.get_mut(key) {
+                accumulator.boundary_overlap_count += 1;
+                add_rejection_reason(accumulator, "boundary_overlap");
+            }
+        }
+
+        if categories_in_step.len() != 1 {
             for value in accumulators.values_mut() {
                 value.rejected_sample_count += 1;
-                value.boundary_overlap_count += 1;
+                add_rejection_reason(
+                    value,
+                    if categories_in_step.is_empty() {
+                        "no_category_token"
+                    } else {
+                        "mixed_category"
+                    },
+                );
             }
             continue;
         }
-        let positive_categories = interval_categories
-            .into_iter()
-            .filter(|(_, value)| value.tokens > 0)
-            .collect::<Vec<_>>();
-        if positive_categories.len() != 1 {
-            for value in accumulators.values_mut() {
-                value.rejected_sample_count += 1;
-            }
-            continue;
-        }
-        let (key, value) = positive_categories.into_iter().next().unwrap();
+
+        let key = categories_in_step.into_iter().next().unwrap();
+        let tokens = valid_tokens_by_category
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
         let Some(accumulator) = accumulators.get_mut(&key) else {
             continue;
         };
+        if tokens <= 0 {
+            accumulator.rejected_sample_count += 1;
+            add_rejection_reason(
+                accumulator,
+                if boundary_categories.contains(&key) {
+                    "boundary_overlap"
+                } else {
+                    "no_category_token"
+                },
+            );
+            continue;
+        }
         accumulator.valid_sample_count += 1;
-        accumulator.observed_tokens = accumulator
-            .observed_tokens
-            .saturating_add(value.tokens.max(0));
+        accumulator.observed_tokens = accumulator.observed_tokens.saturating_add(tokens);
         accumulator.observed_quota_percent += step.observed_delta_percent;
-        accumulator
-            .rates
-            .push(value.tokens.max(0) as f64 / step.observed_delta_percent.max(f64::EPSILON));
+        accumulator.rates.push((
+            tokens as f64 / step.observed_delta_percent.max(f64::EPSILON),
+            step.observed_delta_percent,
+        ));
     }
 
-    if let Some(account_key) = account_key {
-        let pending_start = last_closed_step_end.unwrap_or(start);
-        if pending_start < end {
-            let (pending_categories, _) =
-                interval_category_usage(connection, account_key, pending_start, end)?;
-            for (key, value) in pending_categories {
-                if let Some(accumulator) = accumulators.get_mut(&key) {
-                    accumulator.pending_tokens = accumulator
-                        .pending_tokens
-                        .saturating_add(value.tokens.max(0));
-                }
+    let pending_start = steps.last().map(|step| step.end_at).unwrap_or(start);
+    for sample in &timeline_samples {
+        if sample.sampled_at <= observation_horizon
+            && sample
+                .turn_started_at
+                .map(|started_at| started_at < start)
+                .unwrap_or(true)
+        {
+            if let Some(accumulator) = accumulators.get_mut(&sample.key) {
+                accumulator.pre_observation_tokens = accumulator
+                    .pre_observation_tokens
+                    .saturating_add(sample.delta_tokens.max(0));
+            }
+        }
+        if sample.sampled_at > pending_start {
+            if let Some(accumulator) = accumulators.get_mut(&sample.key) {
+                accumulator.pending_tokens = accumulator
+                    .pending_tokens
+                    .saturating_add(sample.delta_tokens.max(0));
             }
         }
     }
 
     Ok(accumulators
         .into_iter()
-        .map(|(key, value)| {
-            let current_tokens = categories.get(&key).map(|item| item.tokens).unwrap_or(0);
-            let coverage_ratio = if current_tokens > 0 {
-                (value.observed_tokens as f64 / current_tokens as f64).clamp(0.0, 1.0)
+        .map(|(key, mut value)| {
+            let current_tokens = value.current_tokens;
+            let eligible_tokens =
+                (current_tokens - value.pre_observation_tokens - value.pending_tokens).max(0);
+            let coverage_ratio = if eligible_tokens > 0 {
+                (value.observed_tokens as f64 / eligible_tokens as f64).clamp(0.0, 1.0)
             } else {
                 0.0
             };
-            let median_rate = median(&value.rates).unwrap_or(0.0);
+            let rate_values = value
+                .rates
+                .iter()
+                .map(|(rate, _)| *rate)
+                .collect::<Vec<_>>();
+            let median_rate = weighted_median(&value.rates).unwrap_or(0.0);
             let dispersion = if median_rate > 0.0 {
-                median_absolute_deviation(&value.rates, median_rate) / median_rate
+                median_absolute_deviation(&rate_values, median_rate) / median_rate
             } else {
                 f64::INFINITY
             };
             let full_week_tokens = (median_rate * 100.0).round().clamp(0.0, i64::MAX as f64) as i64;
             let current_quota_lower_bound =
                 full_week_tokens as f64 * quota_window.used_percent.clamp(0.0, 100.0) / 100.0;
-            let estimate = if value.valid_sample_count >= MIN_VALID_SAMPLES
-                && value.observed_tokens >= MIN_OBSERVED_TOKENS
-                && value.observed_quota_percent >= MIN_OBSERVED_QUOTA_PERCENT
-                && coverage_ratio >= MIN_COVERAGE_RATIO
-                && full_week_tokens >= current_tokens
-                && current_quota_lower_bound + 1.0 >= current_tokens as f64
-                && dispersion <= MAX_DISPERSION_RATIO
+            if value.valid_sample_count < MIN_VALID_SAMPLES {
+                add_rejection_reason(&mut value, "insufficient_valid_samples");
+            }
+            if value.observed_tokens < MIN_OBSERVED_TOKENS {
+                add_rejection_reason(&mut value, "insufficient_observed_tokens");
+            }
+            if value.observed_quota_percent < MIN_OBSERVED_QUOTA_PERCENT {
+                add_rejection_reason(&mut value, "insufficient_observed_quota");
+            }
+            if coverage_ratio < MIN_COVERAGE_RATIO {
+                add_rejection_reason(&mut value, "coverage_below_threshold");
+            }
+            if current_tokens > 0 && eligible_tokens <= 0 {
+                add_rejection_reason(&mut value, "eligible_tokens_missing");
+            }
+            if full_week_tokens < current_tokens
+                || current_quota_lower_bound + 1.0 < current_tokens as f64
             {
+                add_rejection_reason(&mut value, "sanity_check_failed");
+            }
+            if dispersion > MAX_DISPERSION_RATIO {
+                add_rejection_reason(&mut value, "dispersion_too_high");
+            }
+            let estimate = if value.rejection_reasons.is_empty() {
                 let remaining_tokens =
                     ((full_week_tokens as f64 * quota_window.remaining_percent.max(0.0)) / 100.0)
                         .round()
@@ -417,21 +605,29 @@ fn estimate_weekly_categories(
                     status: USAGE_STATUS_ESTIMATED.into(),
                     estimated_tokens: Some(full_week_tokens),
                     remaining_tokens: Some(remaining_tokens),
+                    current_tokens,
+                    total_category_tokens: current_tokens,
                     observed_sample_count: value.observed_sample_count,
                     valid_sample_count: value.valid_sample_count,
                     observed_tokens: value.observed_tokens,
                     observed_quota_percent: value.observed_quota_percent,
                     cumulative_observed_quota_delta: value.observed_quota_percent,
                     coverage_ratio,
+                    pre_observation_tokens: value.pre_observation_tokens,
+                    eligible_tokens,
                     pending_tokens: value.pending_tokens,
                     rejected_sample_count: value.rejected_sample_count,
+                    boundary_overlap_count: value.boundary_overlap_count,
                     boundary_overlap_ratio: if value.observed_sample_count > 0 {
                         value.boundary_overlap_count as f64 / value.observed_sample_count as f64
                     } else {
                         0.0
                     },
                     dispersion_ratio: dispersion,
-                    external_usage_risk: coverage_ratio < 1.0,
+                    rejection_reasons: value.rejection_reasons,
+                    external_usage_risk: coverage_ratio < 1.0
+                        || value.pre_observation_tokens > 0
+                        || value.pending_tokens > 0,
                     confidence: if coverage_ratio >= 0.85 && dispersion <= 0.35 {
                         Confidence::High
                     } else {
@@ -462,21 +658,32 @@ fn insufficient_estimate(
         status: USAGE_STATUS_INSUFFICIENT_DATA.into(),
         estimated_tokens: None,
         remaining_tokens: None,
+        current_tokens: value.current_tokens,
+        total_category_tokens: value.current_tokens,
         observed_sample_count: value.observed_sample_count,
         valid_sample_count: value.valid_sample_count,
         observed_tokens: value.observed_tokens,
         observed_quota_percent: value.observed_quota_percent,
         cumulative_observed_quota_delta: value.observed_quota_percent,
         coverage_ratio,
+        pre_observation_tokens: value.pre_observation_tokens,
+        eligible_tokens: (value.current_tokens
+            - value.pre_observation_tokens
+            - value.pending_tokens)
+            .max(0),
         pending_tokens: value.pending_tokens,
         rejected_sample_count: value.rejected_sample_count,
+        boundary_overlap_count: value.boundary_overlap_count,
         boundary_overlap_ratio: if value.observed_sample_count > 0 {
             value.boundary_overlap_count as f64 / value.observed_sample_count as f64
         } else {
             0.0
         },
         dispersion_ratio: dispersion,
-        external_usage_risk: coverage_ratio < 1.0 || value.pending_tokens > 0,
+        rejection_reasons: value.rejection_reasons,
+        external_usage_risk: coverage_ratio < 1.0
+            || value.pre_observation_tokens > 0
+            || value.pending_tokens > 0,
         confidence: Confidence::Low,
         source: source.into(),
     }
@@ -831,6 +1038,63 @@ mod tests {
     use super::*;
     use crate::usage::db::initialize_schema;
 
+    fn seed_weekly_steps(connection: &Connection) {
+        connection
+            .execute(
+                "INSERT INTO rate_limit_samples
+                 (account_key, sampled_at, limit_id, window, window_duration_mins,
+                  used_percent, resets_at, source, confidence)
+                 VALUES
+                   ('a', 1000, 'weekly', 'primary', 10080, 10, 20000, 'account_rate_limit', 'high'),
+                   ('a', 2000, 'weekly', 'primary', 10080, 11, 20000, 'account_rate_limit', 'high'),
+                   ('a', 3000, 'weekly', 'primary', 10080, 12, 20000, 'account_rate_limit', 'high'),
+                   ('a', 4000, 'weekly', 'primary', 10080, 13, 20000, 'account_rate_limit', 'high'),
+                   ('a', 5000, 'weekly', 'primary', 10080, 14, 20000, 'account_rate_limit', 'high'),
+                   ('a', 6000, 'weekly', 'primary', 10080, 15, 20000, 'account_rate_limit', 'high'),
+                   ('a', 7000, 'weekly', 'primary', 10080, 16, 20000, 'account_rate_limit', 'high')",
+                [],
+            )
+            .unwrap();
+        quota::refresh_intervals(connection, "a", "weekly", "primary").unwrap();
+    }
+
+    fn insert_timeline_sample(
+        connection: &Connection,
+        turn_id: &str,
+        model: &str,
+        sampled_at: i64,
+        cumulative_tokens: i64,
+        delta_tokens: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, model, reasoning_effort, speed_mode,
+                  sampled_at, cumulative_tokens, delta_tokens, source, confidence)
+                 VALUES ('a', 'thread', ?1, ?2, 'xhigh', 'standard',
+                         ?3, ?4, ?5, 'rollout', 'high')",
+                params![turn_id, model, sampled_at, cumulative_tokens, delta_tokens],
+            )
+            .unwrap();
+    }
+
+    fn single_category_tokens(
+        connection: &Connection,
+        model: &str,
+        tokens: i64,
+    ) -> BTreeMap<CategoryKey, LocalAggregate> {
+        let mut categories = BTreeMap::new();
+        categories.insert(
+            (model.into(), "xhigh".into(), "standard".into()),
+            LocalAggregate {
+                tokens,
+                turn_count: 1,
+            },
+        );
+        let _ = connection;
+        categories
+    }
+
     #[test]
     fn server_credits_are_read_as_snapshot_deltas() {
         let connection = Connection::open_in_memory().unwrap();
@@ -952,6 +1216,16 @@ mod tests {
                     params![turn_id, started_at],
                 )
                 .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO turn_token_samples
+                     (account_key, thread_id, turn_id, model, reasoning_effort, speed_mode,
+                      sampled_at, cumulative_tokens, delta_tokens, source, confidence)
+                     VALUES ('a', 'thread', ?1, 'gpt-5.6-sol', 'high', 'standard',
+                             ?2, 2000, 2000, 'rollout', 'high')",
+                    params![turn_id, started_at],
+                )
+                .unwrap();
         }
         quota::refresh_intervals(&connection, "a", "weekly", "primary").unwrap();
         let mut categories = BTreeMap::new();
@@ -1004,6 +1278,16 @@ mod tests {
                 [],
             )
             .unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, model, reasoning_effort, speed_mode,
+                  sampled_at, cumulative_tokens, delta_tokens, source, confidence)
+                 VALUES ('a', 'thread', 'turn-1', 'gpt-5.6-sol', 'high', 'standard',
+                         2500, 1000, 1000, 'rollout', 'high')",
+                [],
+            )
+            .unwrap();
         quota::refresh_intervals(&connection, "a", "weekly", "primary").unwrap();
         connection
             .execute(
@@ -1048,21 +1332,271 @@ mod tests {
     }
 
     #[test]
-    fn long_turn_crossing_a_quota_step_boundary_is_rejected() {
+    fn long_turn_crossing_a_quota_step_boundary_keeps_token_deltas() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
         connection
             .execute(
-                "INSERT INTO turn_usage
-                 (account_key, thread_id, turn_id, started_at, completed_at, model,
-                  reasoning_effort, speed_mode, raw_total_tokens, source, confidence,
-                  created_at, updated_at)
-                 VALUES ('a', 'thread', 'long', 1500, 2500, 'gpt-5.6-sol', 'high',
-                         'standard', 12000000, 'local_rollout', 'medium', 2500, 2500)",
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, model, reasoning_effort, speed_mode,
+                  sampled_at, cumulative_tokens, delta_tokens, source, confidence)
+                 VALUES
+                   ('a', 'thread', 'long', 'gpt-5.6-sol', 'high', 'standard',
+                    1500, 5000000, 5000000, 'rollout', 'high'),
+                   ('a', 'thread', 'long', 'gpt-5.6-sol', 'high', 'standard',
+                    2500, 12000000, 7000000, 'rollout', 'high')",
                 [],
             )
             .unwrap();
-        assert!(has_boundary_overlap(&connection, "a", 1000, 2000).unwrap());
-        assert!(has_boundary_overlap(&connection, "a", 2000, 3000).unwrap());
+        let samples = timeline_token_samples(&connection, "a", 1000, 3000).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].previous_sampled_at, None);
+        assert_eq!(samples[1].previous_sampled_at, Some(1500));
+        assert_eq!(samples[1].delta_tokens, 7_000_000);
+    }
+
+    #[test]
+    fn mixed_quota_step_is_rejected_without_token_ratio_split() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        insert_timeline_sample(
+            &connection,
+            "luna",
+            "gpt-5.6-luna",
+            2500,
+            5_000_000,
+            5_000_000,
+        );
+        insert_timeline_sample(
+            &connection,
+            "sol",
+            "gpt-5.6-sol",
+            2600,
+            3_000_000,
+            3_000_000,
+        );
+        let mut categories = BTreeMap::new();
+        categories.extend(single_category_tokens(
+            &connection,
+            "gpt-5.6-luna",
+            5_000_000,
+        ));
+        categories.insert(
+            ("gpt-5.6-sol".into(), "xhigh".into(), "standard".into()),
+            LocalAggregate {
+                tokens: 3_000_000,
+                turn_count: 1,
+            },
+        );
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 16.0,
+            remaining_percent: 84.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimates = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap();
+        for key in categories.keys() {
+            let estimate = estimates.get(key).unwrap();
+            assert_eq!(estimate.status, USAGE_STATUS_INSUFFICIENT_DATA);
+            assert!(estimate
+                .rejection_reasons
+                .iter()
+                .any(|reason| reason == "mixed_category"));
+        }
+    }
+
+    #[test]
+    fn long_turn_crossing_two_boundaries_keeps_non_overlapping_deltas() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        for (sampled_at, cumulative_tokens, delta_tokens) in [
+            (1500, 10_000_000, 10_000_000),
+            (2500, 12_000_000, 2_000_000),
+            (3200, 15_000_000, 3_000_000),
+            (3500, 18_000_000, 3_000_000),
+        ] {
+            insert_timeline_sample(
+                &connection,
+                "long",
+                "gpt-5.6-luna",
+                sampled_at,
+                cumulative_tokens,
+                delta_tokens,
+            );
+        }
+        let categories = single_category_tokens(&connection, "gpt-5.6-luna", 18_000_000);
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 16.0,
+            remaining_percent: 84.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimate = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap()
+        .remove(&("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()))
+        .unwrap();
+        assert_eq!(estimate.boundary_overlap_count, 2);
+        assert_eq!(estimate.valid_sample_count, 1);
+        assert_eq!(estimate.observed_tokens, 3_000_000);
+        assert!(estimate
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason == "boundary_overlap"));
+    }
+
+    #[test]
+    fn pending_tokens_are_not_counted_as_closed_step_observations() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        insert_timeline_sample(
+            &connection,
+            "luna",
+            "gpt-5.6-luna",
+            2500,
+            5_000_000,
+            5_000_000,
+        );
+        insert_timeline_sample(
+            &connection,
+            "luna",
+            "gpt-5.6-luna",
+            7500,
+            8_000_000,
+            3_000_000,
+        );
+        let categories = single_category_tokens(&connection, "gpt-5.6-luna", 8_000_000);
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 16.0,
+            remaining_percent: 84.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimate = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap()
+        .remove(&("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()))
+        .unwrap();
+        assert_eq!(estimate.observed_tokens, 5_000_000);
+        assert_eq!(estimate.pending_tokens, 3_000_000);
+        assert_eq!(estimate.eligible_tokens, 5_000_000);
+        assert_eq!(estimate.coverage_ratio, 1.0);
+    }
+
+    #[test]
+    fn pre_observation_tokens_do_not_lower_eligible_coverage() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        insert_timeline_sample(
+            &connection,
+            "luna",
+            "gpt-5.6-luna",
+            1500,
+            1_000_000,
+            1_000_000,
+        );
+        for (index, sampled_at) in [2500, 3500, 4500, 5500, 6500].into_iter().enumerate() {
+            insert_timeline_sample(
+                &connection,
+                &format!("luna-{index}"),
+                "gpt-5.6-luna",
+                sampled_at,
+                2_000_000,
+                2_000_000,
+            );
+        }
+        let categories = single_category_tokens(&connection, "gpt-5.6-luna", 11_000_000);
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 16.0,
+            remaining_percent: 84.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimate = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap()
+        .remove(&("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()))
+        .unwrap();
+        assert_eq!(estimate.pre_observation_tokens, 1_000_000);
+        assert_eq!(estimate.eligible_tokens, 10_000_000);
+        assert_eq!(estimate.observed_tokens, 10_000_000);
+        assert_eq!(estimate.coverage_ratio, 1.0);
+    }
+
+    #[test]
+    fn estimate_below_current_category_tokens_is_rejected() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        for (index, sampled_at) in [2500, 3500, 4500, 5500, 6500].into_iter().enumerate() {
+            insert_timeline_sample(
+                &connection,
+                &format!("small-{index}"),
+                "gpt-5.6-luna",
+                sampled_at,
+                1_000,
+                1_000,
+            );
+        }
+        let categories = single_category_tokens(&connection, "gpt-5.6-luna", 10_000_000);
+        let quota_window = CategoryUsageQuotaWindow {
+            limit_id: "weekly".into(),
+            window: "primary".into(),
+            used_percent: 16.0,
+            remaining_percent: 84.0,
+            window_duration_mins: 10080,
+            resets_at: Some(20000),
+        };
+        let estimate = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10000,
+            Some(&quota_window),
+            &categories,
+        )
+        .unwrap()
+        .remove(&("gpt-5.6-luna".into(), "xhigh".into(), "standard".into()))
+        .unwrap();
+        assert_eq!(estimate.status, USAGE_STATUS_INSUFFICIENT_DATA);
+        assert!(estimate.rejection_reasons.iter().any(|reason| reason == "sanity_check_failed"));
     }
 }

@@ -57,6 +57,11 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 last_seen_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS usage_migrations (
+                name TEXT PRIMARY KEY,
+                completed_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS turn_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_key TEXT NOT NULL,
@@ -79,6 +84,22 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE (account_key, thread_id, turn_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS turn_token_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_key TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                model TEXT,
+                reasoning_effort TEXT NOT NULL,
+                speed_mode TEXT NOT NULL,
+                sampled_at INTEGER NOT NULL,
+                cumulative_tokens INTEGER NOT NULL,
+                delta_tokens INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                UNIQUE (account_key, thread_id, turn_id, cumulative_tokens)
             );
 
             CREATE TABLE IF NOT EXISTS account_daily_usage (
@@ -166,6 +187,8 @@ pub fn initialize_schema(connection: &Connection) -> Result<(), String> {
 
             CREATE INDEX IF NOT EXISTS idx_turn_usage_date
                 ON turn_usage(account_key, started_at);
+            CREATE INDEX IF NOT EXISTS idx_turn_token_samples_time
+                ON turn_token_samples(account_key, sampled_at, thread_id, turn_id);
             CREATE INDEX IF NOT EXISTS idx_account_daily_usage_date
                 ON account_daily_usage(account_key, date);
             CREATE INDEX IF NOT EXISTS idx_thread_usage_group_samples_time
@@ -393,7 +416,9 @@ mod tests {
         initialize_schema(&connection).unwrap();
         for table in [
             "accounts",
+            "usage_migrations",
             "turn_usage",
+            "turn_token_samples",
             "account_daily_usage",
             "thread_usage_group_samples",
             "thread_usage_capabilities",

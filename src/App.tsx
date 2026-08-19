@@ -56,6 +56,35 @@ function confidenceLabel(value: string): string {
   }
 }
 
+function estimatorReasonLabel(value: string): string {
+  switch (value) {
+    case "insufficient_valid_samples":
+      return "有效样本不足";
+    case "insufficient_observed_tokens":
+      return "有效 Token 不足";
+    case "insufficient_observed_quota":
+      return "累计额度变化不足";
+    case "coverage_below_threshold":
+      return "Token coverage 不足";
+    case "eligible_tokens_missing":
+      return "没有可归因 Token 分母";
+    case "boundary_overlap":
+      return "boundary overlap 太多";
+    case "mixed_category":
+      return "同一额度 step 包含多个分类";
+    case "no_category_token":
+      return "额度 step 内没有可归因 Token";
+    case "dispersion_too_high":
+      return "样本离散度过高";
+    case "sanity_check_failed":
+      return "数学一致性检查失败";
+    case "quota_window_missing":
+      return "缺少当前周额度窗口";
+    default:
+      return value;
+  }
+}
+
 function reasoningLabel(value: string): string {
   switch (value) {
     case "low":
@@ -212,27 +241,52 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
             const estimated = estimate?.status === "estimated" && estimate.estimatedTokens != null;
             return (
               <div
-                className="quota-estimate-row"
+                className="quota-estimate-item"
                 key={`${category.model}:${category.reasoningEffort}:${category.speedMode}`}
               >
-                <div className="daily-model-usage-label">
-                  <strong>
-                    {modelLabel(category.model)}
-                    <span className="daily-model-usage-reasoning">
-                      ({reasoningLabel(category.reasoningEffort)})
+                <div className="quota-estimate-row">
+                  <div className="daily-model-usage-label">
+                    <strong>
+                      {modelLabel(category.model)}
+                      <span className="daily-model-usage-reasoning">
+                        ({reasoningLabel(category.reasoningEffort)})
+                      </span>
+                      {category.fast ? <span className="fast-badge" title="快速模式" aria-label="快速模式">⚡</span> : null}
+                    </strong>
+                    <span className="muted tiny">
+                      {category.turnCount} 个轮次 · {formatNumber(category.tokens)} 真实 Token
                     </span>
-                    {category.fast ? <span className="fast-badge" title="快速模式" aria-label="快速模式">⚡</span> : null}
-                  </strong>
-                  <span className="muted tiny">
-                    {category.turnCount} 个轮次 · {formatNumber(category.tokens)} 真实 Token
-                  </span>
+                  </div>
+                  <div className="daily-model-usage-values">
+                    <strong>{estimated ? `≈ ${formatNumber(estimate.estimatedTokens!)} Token` : statusText(estimate?.status ?? "insufficient_data")}</strong>
+                    {estimated ? (
+                      <span className="muted tiny">预估 · {estimate!.validSampleCount} 个有效额度样本 · 置信度 {confidenceLabel(estimate!.confidence)}</span>
+                    ) : null}
+                  </div>
                 </div>
-                <div className="daily-model-usage-values">
-                  <strong>{estimated ? `≈ ${formatNumber(estimate.estimatedTokens!)} Token` : statusText(estimate?.status ?? "insufficient_data")}</strong>
-                  {estimated ? (
-                    <span className="muted tiny">预估 · {estimate!.validSampleCount} 个有效额度样本 · 置信度 {confidenceLabel(estimate!.confidence)}</span>
-                  ) : null}
-                </div>
+                {estimate ? (
+                  <details className="quota-estimate-diagnostics">
+                    <summary>诊断详情</summary>
+                    <div className="quota-estimate-diagnostics-grid">
+                      <span>当前分类 Token</span><strong>{formatNumber(estimate.currentTokens)}</strong>
+                      <span>本周分类总 Token</span><strong>{formatNumber(estimate.totalCategoryTokens)}</strong>
+                      <span>有效样本</span><strong>{estimate.validSampleCount}/{estimate.observedSampleCount}</strong>
+                      <span>有效 Token</span><strong>{formatNumber(estimate.observedTokens)}</strong>
+                      <span>累计额度变化</span><strong>{estimate.observedQuotaPercent.toFixed(2)}%</strong>
+                      <span>Token coverage</span><strong>{(estimate.coverageRatio * 100).toFixed(1)}%</strong>
+                      <span>Pending Token</span><strong>{formatNumber(estimate.pendingTokens)}</strong>
+                      <span>Boundary overlap</span><strong>{estimate.boundaryOverlapCount}（{(estimate.boundaryOverlapRatio * 100).toFixed(1)}%）</strong>
+                      <span>样本离散度</span><strong>{Number.isFinite(estimate.dispersionRatio) ? `${(estimate.dispersionRatio * 100).toFixed(1)}%` : "不可计算"}</strong>
+                      <span>预观测 Token</span><strong>{formatNumber(estimate.preObservationTokens)}</strong>
+                      <span>可归因 Token</span><strong>{formatNumber(estimate.eligibleTokens)}</strong>
+                    </div>
+                    {estimate.rejectionReasons.length ? (
+                      <div className="quota-estimate-diagnostics-reasons">
+                        阻止原因：{estimate.rejectionReasons.map(estimatorReasonLabel).join("、")}
+                      </div>
+                    ) : null}
+                  </details>
+                ) : null}
               </div>
             );
           })}

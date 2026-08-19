@@ -122,9 +122,16 @@ h2 { margin: 5px 0 0; font-size: 21px; letter-spacing: -.02em; }
 .quota-estimate-heading h2, .quota-estimate-remaining h2 { margin: 0; }
 .quota-estimate-warning { margin: 13px 0 0; padding: 9px 10px; border: 1px solid rgba(255, 159, 10, .25); border-radius: 9px; color: #8a5a00; background: rgba(255, 159, 10, .08); font-size: 11px; line-height: 1.4; }
 .quota-estimate-list { display: grid; gap: 0; margin-top: 7px; }
-.quota-estimate-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; }
+.quota-estimate-item { padding: 6px 0; }
+.quota-estimate-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.quota-estimate-row .daily-model-usage-label { min-width: 0; }
 .quota-estimate-row .daily-model-usage-values { max-width: 55%; }
 .quota-estimate-row .daily-model-usage-values strong { font-size: 12px; }
+.quota-estimate-diagnostics { margin-top: 3px; color: #6e6e73; font-size: 10px; }
+.quota-estimate-diagnostics summary { cursor: pointer; width: fit-content; }
+.quota-estimate-diagnostics-grid { display: grid; grid-template-columns: max-content minmax(80px, 1fr) max-content minmax(80px, 1fr); gap: 2px 12px; margin-top: 4px; }
+.quota-estimate-diagnostics-grid strong { color: #3d3d42; font-weight: 600; }
+.quota-estimate-diagnostics-reasons { margin-top: 4px; color: #8a5a00; }
 .quota-estimate-divider { height: 1px; margin: 11px 0 10px; background: rgba(60, 60, 67, .18); }
 .quota-estimate-remaining { display: grid; gap: 6px; }
 .quota-estimate-remaining > div:first-child { display: grid; gap: 2px; }
@@ -256,6 +263,7 @@ h2 { margin: 5px 0 0; font-size: 21px; letter-spacing: -.02em; }
   .app-shell { padding: 22px 18px 20px; }
   .topbar { align-items: flex-start; }
   .quota-grid, .metrics-grid { grid-template-columns: 1fr; }
+  .quota-estimate-diagnostics-grid { grid-template-columns: max-content minmax(0, 1fr); }
   .usage-account-metrics { grid-template-columns: 1fr; }
   .chart { gap: 6px; }
   .chart-value { display: none; }
