@@ -560,10 +560,11 @@ fn estimate_weekly_categories(
             let current_tokens = total_category_tokens;
             let raw_eligible_tokens =
                 current_tokens - value.pre_observation_tokens - value.pending_tokens;
-            let eligible_tokens = raw_eligible_tokens
-                .saturating_sub(value.excluded_tokens)
-                .saturating_sub(value.ambiguous_boundary_tokens)
-                .max(0);
+            // Eligible is the complete post-observation, closed-horizon Token
+            // population. Mixed and boundary-ambiguous Token are excluded
+            // from validObserved, not from this denominator; otherwise an
+            // attribution gap can manufacture 100% coverage.
+            let eligible_tokens = raw_eligible_tokens.max(0);
             let coverage_ratio = if eligible_tokens > 0 {
                 value.observed_tokens as f64 / eligible_tokens as f64
             } else if value.observed_tokens > 0 {
@@ -702,12 +703,8 @@ fn insufficient_estimate(
     ambiguous_boundary_ratio: f64,
     source: &str,
 ) -> CategoryTokenEstimate {
-    let eligible_tokens = (value.current_tokens
-        - value.pre_observation_tokens
-        - value.pending_tokens
-        - value.excluded_tokens
-        - value.ambiguous_boundary_tokens)
-        .max(0);
+    let eligible_tokens =
+        (value.current_tokens - value.pre_observation_tokens - value.pending_tokens).max(0);
     let hard_blockers = value.hard_blockers.clone();
     let warnings = value.warnings.clone();
     let rejection_reasons = diagnostic_reasons(&value);
@@ -964,9 +961,8 @@ pub fn category_usage(connection: &Connection, period: &str) -> Result<CategoryU
     let account_key = recorder::current_account_key(connection)?;
     let data_health: Option<AccountDataHealth> = account_key
         .as_deref()
-        .map(|account_key| rollout::account_data_health(connection, account_key))
-        .transpose()?
-        .flatten();
+        .map(|account_key| rollout::refresh_account_data_health(connection, account_key))
+        .transpose()?;
     let now = Local::now();
     let (start, end, period_source, quota_window) = match period {
         "day" => {
@@ -1091,6 +1087,12 @@ pub fn app_category_usage(
     app: &tauri::AppHandle<tauri::Wry>,
     period: &str,
 ) -> Result<CategoryUsage, String> {
+    // Treat the read as a final safety-net collection point. Filesystem
+    // watcher events can be coalesced or lost while the desktop process is
+    // restarting; the page must not evaluate a stale cursor indefinitely.
+    if let Err(error) = rollout::collect_rollouts(app) {
+        eprintln!("[Usage] category read rollout recovery failed: {error}");
+    }
     let connection = db::open_database(app)?;
     category_usage(&connection, period)
 }
@@ -1688,6 +1690,7 @@ mod tests {
             .unwrap();
         assert_eq!(luna.valid_sample_count, 5);
         assert_eq!(luna.status, USAGE_STATUS_ESTIMATED);
+        assert!((luna.coverage_ratio - (10_000.0 / 12_000.0)).abs() < 0.000_001);
         assert!(!luna
             .hard_blockers
             .iter()

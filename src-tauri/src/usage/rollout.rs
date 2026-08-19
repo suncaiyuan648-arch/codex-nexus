@@ -10,7 +10,7 @@ use std::{
 use super::models::{AccountDataHealth, Confidence, TokenUsage, TurnUsageRecord, SOURCE_ROLLOUT};
 use super::{db, rate_card::RateCard, recorder};
 
-pub const ROLLOUT_PARSER_VERSION: i64 = 4;
+pub const ROLLOUT_PARSER_VERSION: i64 = 9;
 pub const DATA_HEALTH_VERIFIED: &str = "verified";
 pub const DATA_HEALTH_LEGACY_UNVERIFIED: &str = "legacy_unverified";
 pub const DATA_HEALTH_ACCOUNTING_INCONSISTENT: &str = "accounting_inconsistent";
@@ -216,7 +216,7 @@ fn process_line(
     state: &mut CursorState,
     account_key: &str,
 ) -> Result<bool, String> {
-    process_line_inner(connection, line, state, account_key)
+    process_line_inner(connection, line, state, account_key, true)
 }
 
 fn process_line_inner(
@@ -224,6 +224,7 @@ fn process_line_inner(
     line: &str,
     state: &mut CursorState,
     account_key: &str,
+    persist: bool,
 ) -> Result<bool, String> {
     let value: Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
     let timestamp = parse_timestamp(value.get("timestamp")).unwrap_or_else(recorder::now_seconds);
@@ -243,7 +244,14 @@ fn process_line_inner(
             let next_thread_id =
                 string_value(payload.get("thread_id").or_else(|| payload.get("threadId")))
                     .or_else(|| state.session_id.clone());
-            let same_turn = state.turn_id == next_turn_id && state.thread_id == next_thread_id;
+            // `session_meta` is not guaranteed to precede the first
+            // `turn_context`. Token samples already fall back to session_id
+            // when thread_id is absent, so same-turn detection must use the
+            // same resolved identity. Otherwise a later repeated context
+            // resets the canonical total while the earlier timeline deltas
+            // remain attached to the session thread.
+            let current_thread_id = state.thread_id.clone().or_else(|| state.session_id.clone());
+            let same_turn = state.turn_id == next_turn_id && current_thread_id == next_thread_id;
             state.turn_id = next_turn_id;
             state.thread_id = next_thread_id;
             state.model = string_value(payload.get("model"));
@@ -335,23 +343,25 @@ fn process_line_inner(
                 source: SOURCE_ROLLOUT.into(),
                 confidence: sample_confidence.clone(),
             };
-            recorder::ensure_account(connection, account_key, timestamp)?;
-            upsert_turn(connection, &turn)?;
-            if delta_usage.raw_total_tokens > 0 {
-                insert_token_sample(
-                    connection,
-                    account_key,
-                    &turn.thread_id,
-                    &turn.turn_id,
-                    state.segment_no,
-                    model.as_deref(),
-                    &reasoning_effort,
-                    &speed,
-                    timestamp,
-                    cumulative_usage.raw_total_tokens,
-                    delta_usage.raw_total_tokens,
-                    &sample_confidence,
-                )?;
+            if persist {
+                recorder::ensure_account(connection, account_key, timestamp)?;
+                upsert_turn(connection, &turn)?;
+                if delta_usage.raw_total_tokens > 0 {
+                    insert_token_sample(
+                        connection,
+                        account_key,
+                        &turn.thread_id,
+                        &turn.turn_id,
+                        state.segment_no,
+                        model.as_deref(),
+                        &reasoning_effort,
+                        &speed,
+                        timestamp,
+                        cumulative_usage.raw_total_tokens,
+                        delta_usage.raw_total_tokens,
+                        &sample_confidence,
+                    )?;
+                }
             }
             Ok(true)
         }
@@ -643,8 +653,6 @@ fn account_health_counts(
 }
 
 const SOURCE_LAG_TOLERANCE_SECONDS: i64 = 5 * 60;
-const PENDING_FILE_ACTIVE_WINDOW_SECONDS: i64 = 15 * 60;
-
 fn file_modified_at(path: &str) -> Option<i64> {
     fs::metadata(path)
         .ok()?
@@ -671,7 +679,17 @@ fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i6
         .map_err(|error| error.to_string())?;
     drop(statement);
 
-    let now = recorder::now_seconds();
+    let quota_window_start: Option<i64> = connection
+        .query_row(
+            "SELECT resets_at - window_duration_mins * 60
+             FROM rate_limit_samples
+             WHERE account_key = ?1 AND resets_at IS NOT NULL
+             ORDER BY sampled_at DESC, id DESC LIMIT 1",
+            [account_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
     let mut incomplete_count = 0;
     for (path, status) in rows {
         let Some(metadata) = fs::metadata(&path).ok() else {
@@ -679,9 +697,14 @@ fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i6
         };
         let modified_at = file_modified_at(&path);
         if status == "pending" {
-            if modified_at.is_some_and(|modified| {
-                now.saturating_sub(modified) <= PENDING_FILE_ACTIVE_WINDOW_SECONDS
-            }) {
+            // Pending ownership cannot become complete merely because the
+            // file stopped changing. If it overlaps the active quota window,
+            // its Token rows can still affect the estimator for the entire
+            // cycle and must remain a hard source-completeness blocker.
+            if quota_window_start
+                .map(|start| modified_at.is_some_and(|modified| modified >= start))
+                .unwrap_or(true)
+            {
                 incomplete_count += 1;
             }
             continue;
@@ -701,9 +724,29 @@ fn source_completeness(connection: &Connection, account_key: &str) -> Result<(i6
         }
     }
 
+    // A later unchanged quota poll is not evidence of missing local Token.
+    // Compare the timeline only with real in-cycle quota consumption
+    // transitions, otherwise an idle account becomes source-incomplete after
+    // five minutes simply because polling continued.
     let latest_quota: Option<i64> = connection
         .query_row(
-            "SELECT MAX(sampled_at) FROM rate_limit_samples WHERE account_key = ?1",
+            "SELECT MAX(sampled_at) FROM (
+               SELECT sampled_at, used_percent, resets_at, window_duration_mins,
+                      LAG(used_percent) OVER bucket AS previous_percent,
+                      LAG(resets_at) OVER bucket AS previous_resets_at,
+                      LAG(window_duration_mins) OVER bucket AS previous_duration
+               FROM rate_limit_samples
+               WHERE account_key = ?1
+               WINDOW bucket AS (
+                 PARTITION BY limit_id, window ORDER BY sampled_at, id
+               )
+             )
+             WHERE previous_percent IS NOT NULL
+               AND used_percent > previous_percent
+               AND window_duration_mins = previous_duration
+               AND ((resets_at IS NULL AND previous_resets_at IS NULL)
+                    OR (resets_at IS NOT NULL AND previous_resets_at IS NOT NULL
+                        AND ABS(resets_at - previous_resets_at) <= 5))",
             [account_key],
             |row| row.get(0),
         )
@@ -812,6 +855,31 @@ fn set_account_data_health(
         .map_err(|error| error.to_string())?;
     account_data_health(connection, account_key)?
         .ok_or_else(|| "account data health missing".into())
+}
+
+/// Re-evaluate source completeness against the latest quota transition.
+/// Stored health is a cache, so quota ingestion and read paths must refresh it
+/// even when no rollout file event arrived in between.
+pub fn refresh_account_data_health(
+    connection: &Connection,
+    account_key: &str,
+) -> Result<AccountDataHealth, String> {
+    let previous = account_data_health(connection, account_key)?;
+    let data_version = previous
+        .as_ref()
+        .map(|health| health.data_version)
+        .unwrap_or_default();
+    let requested_status = previous
+        .as_ref()
+        .map(|health| health.status.as_str())
+        .map(|status| match status {
+            DATA_HEALTH_REBUILDING => DATA_HEALTH_REBUILDING,
+            DATA_HEALTH_LEGACY_UNVERIFIED => DATA_HEALTH_LEGACY_UNVERIFIED,
+            DATA_HEALTH_ACCOUNTING_INCONSISTENT => DATA_HEALTH_ACCOUNTING_INCONSISTENT,
+            _ => DATA_HEALTH_VERIFIED,
+        })
+        .unwrap_or(DATA_HEALTH_LEGACY_UNVERIFIED);
+    set_account_data_health(connection, account_key, requested_status, data_version)
 }
 
 pub(crate) fn classify_legacy_accounts(connection: &Connection) -> Result<(), String> {
@@ -1234,6 +1302,172 @@ fn quarantine_unverified_account_data(
     Ok(())
 }
 
+fn advance_cursor_without_persisting(
+    connection: &Connection,
+    path: &str,
+    account_key: &str,
+) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let mut cursor = load_cursor(connection, path)?.unwrap_or_else(fresh_cursor);
+    if metadata.len() < cursor.byte_offset {
+        cursor = fresh_cursor();
+    }
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(cursor.byte_offset))
+        .map_err(|error| error.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut offset = cursor.byte_offset;
+    loop {
+        line.clear();
+        let line_start = offset;
+        let bytes = reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if bytes == 0 {
+            break;
+        }
+        offset += bytes as u64;
+        if !line.ends_with('\n') {
+            offset = line_start;
+            break;
+        }
+        if let Err(error) = process_line_inner(
+            connection,
+            line.trim_end(),
+            &mut cursor.state,
+            account_key,
+            false,
+        ) {
+            // Historical reset is deliberately lossy. A malformed complete
+            // row must not pin the migration to this byte forever, and its
+            // unknown semantics make retaining the previous identity unsafe.
+            eprintln!("[Usage] skipped malformed historical rollout row in {path}: {error}");
+            cursor.state = fresh_cursor().state;
+        }
+    }
+    cursor.state.parser_version = ROLLOUT_PARSER_VERSION;
+    cursor.state.turn_start_totals = cursor.state.last_totals.clone();
+    cursor.state.turn_segment_start_usage = cursor.state.last_totals.clone();
+    cursor.state.turn_accumulated_usage = TokenUsage::default();
+    cursor.state.turn_started_at = Some(recorder::now_seconds());
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or_else(recorder::now_seconds);
+    save_cursor(connection, path, offset, modified_at, &cursor.state)
+}
+
+/// Parser v9 deliberately starts a new account ledger instead of trying to
+/// infer ownership for historical files that predate durable bindings. Raw
+/// JSONL and quota observations are retained, while rollout-derived rows are
+/// cleared and every existing cursor is rebased to EOF. Unowned files remain
+/// quarantined, but an explicit later watcher event may bind their already
+/// rebased tail. Future bytes therefore start at zero without replaying dirty
+/// history or permanently losing a rollout that is still growing.
+fn reset_historical_rollout_data(connection: &Connection, account_key: &str) -> Result<(), String> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    quarantine_unverified_account_data(&transaction, account_key)?;
+    transaction
+        .execute(
+            "DELETE FROM turn_timeline_audits WHERE account_key = ?1",
+            [account_key],
+        )
+        .map_err(|error| error.to_string())?;
+
+    // Remove rollout-derived history for all already-unverified accounts too.
+    // These rows cannot be reconciled to a trustworthy timeline and keeping
+    // them would leave the database-wide accounting invariant broken.
+    let mut legacy_statement = transaction
+        .prepare(
+            "SELECT account_key FROM account_usage_data_versions
+             WHERE account_key != ?1 AND status = 'legacy_unverified'",
+        )
+        .map_err(|error| error.to_string())?;
+    let legacy_accounts = legacy_statement
+        .query_map([account_key], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(legacy_statement);
+    for legacy_account in legacy_accounts {
+        quarantine_unverified_account_data(&transaction, &legacy_account)?;
+        transaction
+            .execute(
+                "DELETE FROM turn_timeline_audits WHERE account_key = ?1",
+                [&legacy_account],
+            )
+            .map_err(|error| error.to_string())?;
+        set_account_data_health(
+            &transaction,
+            &legacy_account,
+            DATA_HEALTH_LEGACY_UNVERIFIED,
+            0,
+        )?;
+    }
+
+    // Existing unattributed files are excluded from history, but receive a
+    // state-only cursor before quarantine. If one later grows, the explicit
+    // watcher event can safely bind and collect only bytes after this reset.
+    transaction
+        .execute(
+            "UPDATE rollout_file_bindings
+             SET status = 'quarantined', reason = 'historical_reset_v9:' || ?1
+             WHERE account_key IS NULL",
+            [account_key],
+        )
+        .map_err(|error| error.to_string())?;
+
+    let mut statement = transaction
+        .prepare(
+            "SELECT file_path FROM rollout_file_bindings
+             WHERE (account_key = ?1 AND status = 'bound')
+                OR (account_key IS NULL AND reason = 'historical_reset_v9:' || ?1)",
+        )
+        .map_err(|error| error.to_string())?;
+    let paths = statement
+        .query_map([account_key], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+
+    for path in paths {
+        if !Path::new(&path).is_file() {
+            // A bound file can be temporarily absent (for example while it is
+            // being archived). Do not leave an old-version cursor that would
+            // cause collect_one to restart at byte zero if the file returns.
+            transaction
+                .execute(
+                    "UPDATE rollout_file_bindings
+                     SET account_key = NULL, status = 'quarantined',
+                         reason = 'historical_reset_v9:' || ?2
+                     WHERE file_path = ?1",
+                    params![path, account_key],
+                )
+                .map_err(|error| error.to_string())?;
+            transaction
+                .execute("DELETE FROM rollout_cursors WHERE file_path = ?1", [&path])
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        advance_cursor_without_persisting(&transaction, &path, account_key)?;
+    }
+
+    set_account_data_health(
+        &transaction,
+        account_key,
+        DATA_HEALTH_VERIFIED,
+        ROLLOUT_PARSER_VERSION,
+    )?;
+    mark_rollout_rebuild_completed(&transaction, account_key)?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 fn rebuild_rollout_derived_data(
     connection: &Connection,
     files: &[PathBuf],
@@ -1243,9 +1477,10 @@ fn rebuild_rollout_derived_data(
     let prior_health = account_data_health(connection, account_key)?;
     if prior_health.as_ref().is_some_and(|health| {
         health.data_version < ROLLOUT_PARSER_VERSION
-            && health.status != DATA_HEALTH_LEGACY_UNVERIFIED
+            && (health.data_version > 0 || health.status != DATA_HEALTH_LEGACY_UNVERIFIED)
     }) {
-        quarantine_unverified_account_data(connection, account_key)?;
+        reset_historical_rollout_data(connection, account_key)?;
+        return Ok(false);
     }
     if rollout_rebuild_completed(connection, account_key, files)? {
         return Ok(false);
@@ -1450,19 +1685,19 @@ fn bind_or_quarantine_rollout_file(
     allow_new_binding: bool,
 ) -> Result<bool, String> {
     let path_string = path.to_string_lossy().into_owned();
-    let existing: Option<(Option<String>, String)> = connection
+    let existing: Option<(Option<String>, String, Option<String>)> = connection
         .query_row(
-            "SELECT account_key, status FROM rollout_file_bindings
+            "SELECT account_key, status, reason FROM rollout_file_bindings
              WHERE file_path = ?1",
             [&path_string],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?;
     let now = recorder::now_seconds();
     let modified_at = file_modified_at(&path_string);
     match existing {
-        Some((Some(bound_account), status)) if status == "bound" => {
+        Some((Some(bound_account), status, _)) if status == "bound" => {
             connection
                 .execute(
                     "UPDATE rollout_file_bindings
@@ -1473,26 +1708,65 @@ fn bind_or_quarantine_rollout_file(
                 .map_err(|error| error.to_string())?;
             Ok(bound_account == account_key)
         }
-        Some((None, status)) => {
-            let has_cursor: bool = connection
+        Some((None, status, reason)) => {
+            let cursor_offset: Option<i64> = connection
                 .query_row(
-                    "SELECT EXISTS(
-                       SELECT 1 FROM rollout_cursors WHERE file_path = ?1
-                     )",
+                    "SELECT byte_offset FROM rollout_cursors WHERE file_path = ?1",
                     [&path_string],
                     |row| row.get(0),
                 )
+                .optional()
                 .map_err(|error| error.to_string())?;
-            if allow_new_binding && !has_cursor && (status == "pending" || status == "quarantined")
+            let has_cursor = cursor_offset.is_some();
+            let reset_quarantine = status == "quarantined"
+                && matches!(
+                    reason.as_deref(),
+                    Some("historical_reset_v6")
+                        | Some("historical_reset_v7")
+                        | Some("historical_reset_v8")
+                );
+            let account_reset_reason = format!("historical_reset_v9:{account_key}");
+            let account_reset_quarantine =
+                status == "quarantined" && reason.as_deref() == Some(&account_reset_reason);
+            let grew_after_reset = account_reset_quarantine
+                && cursor_offset.is_some_and(|offset| {
+                    fs::metadata(&path_string)
+                        .ok()
+                        .is_some_and(|metadata| metadata.len() > offset.max(0) as u64)
+                });
+            let returned_after_reset = account_reset_quarantine
+                && cursor_offset.is_none()
+                && Path::new(&path_string).is_file();
+            if (allow_new_binding
+                && (status == "pending" || reset_quarantine || account_reset_quarantine))
+                || grew_after_reset
+                || returned_after_reset
             {
+                // Databases that already ran the flawed v6 reset can contain
+                // an active quarantined file with no cursor. Rebase it at the
+                // first later watcher observation; this intentionally drops
+                // all bytes through that recovery point, then resumes safely.
+                if (reset_quarantine || account_reset_quarantine) && !has_cursor {
+                    advance_cursor_without_persisting(connection, &path_string, account_key)?;
+                }
                 connection
                     .execute(
                         "UPDATE rollout_file_bindings
                          SET account_key = ?2, status = 'bound',
-                             reason = 'first_watcher_observation',
+                             reason = CASE WHEN ?6
+                                      THEN 'watcher_tail_after_historical_reset'
+                                      WHEN ?5 THEN 'watcher_tail_after_legacy_cursor'
+                                      ELSE 'first_watcher_observation' END,
                              last_seen_at = ?3, last_modified_at = ?4
                          WHERE file_path = ?1",
-                        params![path_string, account_key, now, modified_at],
+                        params![
+                            path_string,
+                            account_key,
+                            now,
+                            modified_at,
+                            has_cursor,
+                            reset_quarantine || account_reset_quarantine
+                        ],
                     )
                     .map_err(|error| error.to_string())?;
                 Ok(true)
@@ -1827,6 +2101,54 @@ mod tests {
     }
 
     #[test]
+    fn late_session_meta_does_not_reset_a_repeated_turn_context() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let mut state = CursorState::default();
+        let first_context = r#"{"timestamp":"2026-08-14T00:00:01Z","type":"turn_context","payload":{"turn_id":"t","model":"gpt-5.6-sol","effort":"high","service_tier":"standard"}}"#;
+        process_line(&connection, first_context, &mut state, "a").unwrap();
+        process_line(
+            &connection,
+            r#"{"timestamp":"2026-08-14T00:00:02Z","type":"session_meta","payload":{"session_id":"s"}}"#,
+            &mut state,
+            "a",
+        )
+        .unwrap();
+        process_line(
+            &connection,
+            r#"{"timestamp":"2026-08-14T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100}}}}"#,
+            &mut state,
+            "a",
+        )
+        .unwrap();
+        process_line(
+            &connection,
+            r#"{"timestamp":"2026-08-14T00:00:04Z","type":"turn_context","payload":{"turn_id":"t","model":"gpt-5.6-sol","effort":"high","service_tier":"standard"}}"#,
+            &mut state,
+            "a",
+        )
+        .unwrap();
+        process_line(
+            &connection,
+            r#"{"timestamp":"2026-08-14T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"total_tokens":200}}}}"#,
+            &mut state,
+            "a",
+        )
+        .unwrap();
+
+        let turn: (i64, i64) = connection
+            .query_row(
+                "SELECT started_at, raw_total_tokens FROM turn_usage
+                 WHERE account_key = 'a' AND thread_id = 's' AND turn_id = 't'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(turn, (1786665601, 200));
+        verify_token_accounting(&connection, Some("a")).unwrap();
+    }
+
+    #[test]
     fn repeated_cumulative_value_after_reset_is_not_deduplicated() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
@@ -2110,6 +2432,100 @@ mod tests {
     }
 
     #[test]
+    fn quota_transition_refreshes_stale_verified_health() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_usage
+                 (account_key, thread_id, turn_id, started_at, reasoning_effort,
+                  speed_mode, raw_total_tokens, source, confidence, created_at, updated_at)
+                 VALUES ('a', 'thread', 'turn', 100, 'high', 'standard',
+                         10, 'rollout', 'high', 100, 100)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, segment_no, reasoning_effort,
+                  speed_mode, sampled_at, cumulative_tokens, delta_tokens,
+                  source, confidence)
+                 VALUES ('a', 'thread', 'turn', 0, 'high', 'standard',
+                         100, 10, 10, 'rollout', 'high')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rate_limit_samples
+                 (account_key, sampled_at, limit_id, window, window_duration_mins,
+                  used_percent, resets_at, source, confidence)
+                 VALUES ('a', 100, 'codex', 'primary', 10080, 1.0, 10000,
+                         'rate_limits', 'high')",
+                [],
+            )
+            .unwrap();
+        let health = set_account_data_health(
+            &connection,
+            "a",
+            DATA_HEALTH_VERIFIED,
+            ROLLOUT_PARSER_VERSION,
+        )
+        .unwrap();
+        assert_eq!(health.status, DATA_HEALTH_VERIFIED);
+
+        connection
+            .execute(
+                "INSERT INTO rate_limit_samples
+                 (account_key, sampled_at, limit_id, window, window_duration_mins,
+                  used_percent, resets_at, source, confidence)
+                 VALUES ('a', 501, 'codex', 'primary', 10080, 2.0, 10000,
+                         'rate_limits', 'high')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            account_data_health(&connection, "a")
+                .unwrap()
+                .unwrap()
+                .status,
+            DATA_HEALTH_VERIFIED
+        );
+        let refreshed = refresh_account_data_health(&connection, "a").unwrap();
+        assert_eq!(refreshed.status, DATA_HEALTH_SOURCE_INCOMPLETE);
+        assert_eq!(refreshed.source_lag_seconds, 401);
+        assert_eq!(refreshed.source_incomplete_count, 1);
+    }
+
+    #[test]
+    fn unchanged_quota_polls_do_not_create_source_lag() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        for sampled_at in [100, 1_000] {
+            connection
+                .execute(
+                    "INSERT INTO rate_limit_samples
+                     (account_key, sampled_at, limit_id, window, window_duration_mins,
+                      used_percent, resets_at, source, confidence)
+                     VALUES ('a', ?1, 'codex', 'primary', 10080, 1.0, 10000,
+                             'rate_limits', 'high')",
+                    [sampled_at],
+                )
+                .unwrap();
+        }
+        let health = set_account_data_health(
+            &connection,
+            "a",
+            DATA_HEALTH_VERIFIED,
+            ROLLOUT_PARSER_VERSION,
+        )
+        .unwrap();
+        assert_eq!(health.status, DATA_HEALTH_VERIFIED);
+        assert_eq!(health.source_lag_seconds, 0);
+    }
+
+    #[test]
     fn rollout_rebuild_is_idempotent() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
@@ -2235,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_migration_quarantines_previously_verified_unattributed_rows() {
+    fn v9_migration_discards_previously_verified_dirty_history() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
         connection
@@ -2288,17 +2704,297 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT reason FROM turn_timeline_audits
-                     WHERE account_key = 'a' AND turn_id = 'polluted'",
+                    "SELECT COUNT(*) FROM turn_timeline_audits
+                     WHERE account_key = 'a'",
                     [],
-                    |row| row.get::<_, String>(0),
+                    |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            "account_unresolved"
+            0
         );
         let health = account_data_health(&connection, "a").unwrap().unwrap();
         assert_eq!(health.data_version, ROLLOUT_PARSER_VERSION);
-        assert_eq!(health.status, DATA_HEALTH_LEGACY_UNVERIFIED);
+        assert_eq!(health.status, DATA_HEALTH_VERIFIED);
+    }
+
+    #[test]
+    fn v9_migration_advances_lagging_cursor_without_counting_skipped_history() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "codex-nexus-v9-rebase-{}-{}.jsonl",
+            std::process::id(),
+            recorder::now_seconds()
+        ));
+        let prefix = [
+            r#"{"timestamp":"2026-08-14T00:00:00Z","type":"session_meta","payload":{"session_id":"s"}}"#,
+            r#"{"timestamp":"2026-08-14T00:00:01Z","type":"turn_context","payload":{"turn_id":"t","model":"gpt-5.6-sol","effort":"high","service_tier":"standard"}}"#,
+            r#"{"timestamp":"2026-08-14T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100}}}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, &prefix).unwrap();
+        collect_one(&connection, &path, "a", "before-v9").unwrap();
+        connection
+            .execute(
+                "INSERT INTO rollout_file_bindings
+                 (file_path, account_key, status, reason, first_seen_at, last_seen_at)
+                 VALUES (?1, 'a', 'bound', 'test', 1, 1)",
+                [path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_usage_data_versions
+                 (account_key, rollout_parser_version, status, timeline_status,
+                  missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+                  parse_error_count, source_incomplete_count, source_lag_seconds, updated_at)
+                 VALUES ('a', 5, 'verified', 'complete', 0, 0, 0, 0, 0, 0, 1)
+                 ON CONFLICT(account_key) DO UPDATE SET
+                   rollout_parser_version = 5, status = 'verified', updated_at = 1",
+                [],
+            )
+            .unwrap();
+
+        let skipped = prefix.clone()
+            + r#"{"timestamp":"2026-08-14T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"total_tokens":200}}}}"#
+            + "\n";
+        fs::write(&path, &skipped).unwrap();
+        assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "a").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM turn_usage WHERE account_key = 'a'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        let fresh = skipped
+            + r#"{"timestamp":"2026-08-14T00:00:04Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250,"total_tokens":250}}}}"#
+            + "\n";
+        fs::write(&path, fresh).unwrap();
+        collect_one(&connection, &path, "a", "after-v9").unwrap();
+        let total: i64 = connection
+            .query_row(
+                "SELECT raw_total_tokens FROM turn_usage WHERE account_key = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 50);
+        verify_token_accounting(&connection, Some("a")).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v9_quarantined_active_file_resumes_from_migration_tail() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "codex-nexus-v9-active-tail-{}-{}.jsonl",
+            std::process::id(),
+            recorder::now_seconds()
+        ));
+        let historical = [
+            r#"{"timestamp":"2026-08-14T00:00:00Z","type":"session_meta","payload":{"session_id":"s"}}"#,
+            r#"{"timestamp":"2026-08-14T00:00:01Z","type":"turn_context","payload":{"turn_id":"t","model":"gpt-5.6-sol","effort":"high","service_tier":"standard"}}"#,
+            r#"{"timestamp":"2026-08-14T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100}}}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, &historical).unwrap();
+        connection
+            .execute(
+                "INSERT INTO rollout_file_bindings
+                 (file_path, account_key, status, reason, first_seen_at, last_seen_at)
+                 VALUES (?1, NULL, 'pending', 'awaiting_watcher_binding', 1, 1)",
+                [path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_usage_data_versions
+                 (account_key, rollout_parser_version, status, timeline_status,
+                  missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+                  parse_error_count, source_incomplete_count, source_lag_seconds, updated_at)
+                 VALUES ('a', 8, 'verified', 'complete', 0, 0, 0, 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+
+        assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "a").unwrap());
+        let migrated: (String, i64) = connection
+            .query_row(
+                "SELECT b.status, c.byte_offset
+                 FROM rollout_file_bindings b
+                 JOIN rollout_cursors c ON c.file_path = b.file_path
+                 WHERE b.file_path = ?1",
+                [path.to_string_lossy().as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, ("quarantined".into(), historical.len() as i64));
+
+        let fresh = historical
+            + r#"{"timestamp":"2026-08-14T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"total_tokens":150}}}}"#
+            + "\n";
+        fs::write(&path, fresh).unwrap();
+        assert!(bind_or_quarantine_rollout_file(&connection, &path, "a", false).unwrap());
+        assert!(collect_one(&connection, &path, "a", "after-v9").unwrap());
+        let total: i64 = connection
+            .query_row(
+                "SELECT raw_total_tokens FROM turn_usage WHERE account_key = 'a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 50);
+        verify_token_accounting(&connection, Some("a")).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v9_migration_skips_malformed_historical_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "codex-nexus-v9-malformed-{}-{}.jsonl",
+            std::process::id(),
+            recorder::now_seconds()
+        ));
+        let content = [
+            r#"{"timestamp":"2026-08-14T00:00:00Z","type":"session_meta","payload":{"session_id":"s"}}"#,
+            "not-json",
+            r#"{"timestamp":"2026-08-14T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100}}}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, &content).unwrap();
+        connection
+            .execute(
+                "INSERT INTO rollout_file_bindings
+                 (file_path, account_key, status, reason, first_seen_at, last_seen_at)
+                 VALUES (?1, NULL, 'pending', 'awaiting_watcher_binding', 1, 1)",
+                [path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_usage_data_versions
+                 (account_key, rollout_parser_version, status, timeline_status,
+                  missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+                  parse_error_count, source_incomplete_count, source_lag_seconds, updated_at)
+                 VALUES ('a', 8, 'verified', 'complete', 0, 0, 0, 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+
+        assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "a").unwrap());
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT byte_offset FROM rollout_cursors WHERE file_path = ?1",
+                [path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, content.len() as i64);
+        assert_eq!(
+            account_data_health(&connection, "a")
+                .unwrap()
+                .unwrap()
+                .data_version,
+            ROLLOUT_PARSER_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM turn_usage", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v9_missing_bound_file_is_rebased_if_it_returns() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "codex-nexus-v9-returned-{}-{}.jsonl",
+            std::process::id(),
+            recorder::now_seconds()
+        ));
+        let path_string = path.to_string_lossy().into_owned();
+        connection
+            .execute(
+                "INSERT INTO rollout_file_bindings
+                 (file_path, account_key, status, reason, first_seen_at, last_seen_at)
+                 VALUES (?1, 'a', 'bound', 'old-binding', 1, 1)",
+                [&path_string],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rollout_cursors
+                 (file_path, byte_offset, last_scanned_at, state_json)
+                 VALUES (?1, 10, 1, '{\"parserVersion\":8}')",
+                [&path_string],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO account_usage_data_versions
+                 (account_key, rollout_parser_version, status, timeline_status,
+                  missing_timeline_turns, orphan_timeline_samples, mismatched_turns,
+                  parse_error_count, source_incomplete_count, source_lag_seconds, updated_at)
+                 VALUES ('a', 8, 'verified', 'complete', 0, 0, 0, 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+
+        assert!(!rebuild_rollout_derived_data(&connection, &[path.clone()], "a").unwrap());
+        let migrated: (Option<String>, String, i64) = connection
+            .query_row(
+                "SELECT account_key, status,
+                        (SELECT COUNT(*) FROM rollout_cursors WHERE file_path = ?1)
+                 FROM rollout_file_bindings WHERE file_path = ?1",
+                [&path_string],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, (None, "quarantined".into(), 0));
+
+        let historical = [
+            r#"{"timestamp":"2026-08-14T00:00:00Z","type":"session_meta","payload":{"session_id":"s"}}"#,
+            r#"{"timestamp":"2026-08-14T00:00:01Z","type":"turn_context","payload":{"turn_id":"t","model":"gpt-5.6-sol","effort":"high","service_tier":"standard"}}"#,
+            r#"{"timestamp":"2026-08-14T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"total_tokens":100}}}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, &historical).unwrap();
+        assert!(bind_or_quarantine_rollout_file(&connection, &path, "a", false).unwrap());
+        assert!(!collect_one(&connection, &path, "a", "returned-baseline").unwrap());
+
+        let fresh = historical
+            + r#"{"timestamp":"2026-08-14T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"total_tokens":150}}}}"#
+            + "\n";
+        fs::write(&path, fresh).unwrap();
+        assert!(collect_one(&connection, &path, "a", "returned-fresh").unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT raw_total_tokens FROM turn_usage WHERE account_key = 'a'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            50
+        );
+        verify_token_accounting(&connection, Some("a")).unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 use crate::{codex::CodexRpcClient, monitor, usage};
 
-use super::{quota, recorder, rollout};
+use super::{db, quota, recorder, rollout};
 
 const LOCAL_USAGE_DEBOUNCE: Duration = Duration::from_secs(3);
 const SETTLEMENT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(12), Duration::from_secs(30)];
@@ -515,6 +515,13 @@ fn run_scheduler(
                 // The notification path has already persisted the sample.
                 // It also gives the short-lived settlement loop a chance to
                 // stop early when the server has settled the Turn.
+                match refresh_rollout_ledger(&app) {
+                    Ok(true) => usage::emit_usage_data_invalidated(&app, "local_rollout"),
+                    Ok(false) => {}
+                    Err(error) => {
+                        eprintln!("[Usage] quota-triggered rollout recovery failed: {error}")
+                    }
+                }
                 if let Some(state) = settlement.as_ref() {
                     if quota_marker_changed(&state.baseline, &latest_weekly_quota_marker(&app)) {
                         settlement = None;
@@ -842,6 +849,11 @@ fn apply_snapshot(
     if let Err(error) = recorder::record_official_snapshot(app, &snapshot) {
         eprintln!("[Usage] scheduler failed to record snapshot: {error}");
     }
+    match refresh_rollout_ledger(app) {
+        Ok(true) => usage::emit_usage_data_invalidated(app, "local_rollout"),
+        Ok(false) => {}
+        Err(error) => eprintln!("[Usage] snapshot rollout recovery failed: {error}"),
+    }
     monitor::process_snapshot(app, &snapshot);
     if let Ok(mut current) = latest_snapshot.lock() {
         *current = Some(snapshot.clone());
@@ -850,6 +862,15 @@ fn apply_snapshot(
     app.emit("codex://usage-snapshot", snapshot)
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn refresh_rollout_ledger(app: &AppHandle<Wry>) -> Result<bool, String> {
+    let changed = rollout::collect_rollouts(app)?;
+    let connection = db::open_database(app)?;
+    if let Some(account_key) = recorder::current_account_key(&connection)? {
+        rollout::refresh_account_data_health(&connection, &account_key)?;
+    }
+    Ok(changed)
 }
 
 fn publish_status(
