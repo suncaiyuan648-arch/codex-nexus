@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codex.nexus.collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NEXUS_COLLECTOR_ABSOLUTE_PATH__</string>
+    <string>--database</string>
+    <string>__NEXUS_USAGE_DATABASE_ABSOLUTE_PATH__</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__NEXUS_COLLECTOR_LOG_ABSOLUTE_PATH__</string>
+  <key>StandardErrorPath</key>
+  <string>__NEXUS_COLLECTOR_ERROR_LOG_ABSOLUTE_PATH__</string>
+</dict>
+</plist>

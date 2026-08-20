@@ -7,7 +7,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::models::{AccountDataHealth, Confidence, TokenUsage, TurnUsageRecord, SOURCE_ROLLOUT};
+use super::models::{
+    is_unresolved_account_key, AccountDataHealth, Confidence, TokenUsage, TurnUsageRecord,
+    SOURCE_ROLLOUT,
+};
 use super::{collector_core::BINDING_VERIFIED, db, rate_card::RateCard, recorder};
 
 pub const ROLLOUT_PARSER_VERSION: i64 = 9;
@@ -2196,6 +2199,12 @@ fn discover_rollout_files(extra: Option<&Path>) -> Vec<PathBuf> {
     files
 }
 
+/// Standalone collector discovery. This deliberately returns files without
+/// assigning ownership; binding decisions remain in `collector_core`.
+pub fn discover_rollout_files_for_collector() -> Vec<PathBuf> {
+    discover_rollout_files(None)
+}
+
 pub fn collect_rollout_file(
     app: &tauri::AppHandle<tauri::Wry>,
     path: &Path,
@@ -2205,9 +2214,6 @@ pub fn collect_rollout_file(
     }
     let connection = db::open_database_for_collector(app)?;
     let observed_account = recorder::current_account_key(&connection)?;
-    let account_key = observed_account
-        .clone()
-        .unwrap_or_else(|| "local:rollout".into());
     let source_id =
         super::collector_core::register_source(&connection, path, recorder::now_seconds())?;
     let collector_changed = super::collector_core::catch_up_path(
@@ -2220,6 +2226,9 @@ pub fn collect_rollout_file(
     if observed_account.is_none() {
         return Ok(collector_changed);
     }
+    let account_key = observed_account
+        .clone()
+        .expect("observed account checked above");
     let durable_binding: Option<(Option<String>, String)> = connection
         .query_row(
             "SELECT account_key, binding_status FROM rollout_sources WHERE source_id = ?1",
@@ -2264,9 +2273,7 @@ pub fn collect_rollout_file(
 
 pub fn collect_rollouts(app: &tauri::AppHandle<tauri::Wry>) -> Result<bool, String> {
     let connection = db::open_database_for_collector(app)?;
-    let account_key =
-        recorder::current_account_key(&connection)?.unwrap_or_else(|| "local:rollout".into());
-    recorder::ensure_account(&connection, &account_key, recorder::now_seconds())?;
+    let observed_account = recorder::current_account_key(&connection)?;
     classify_legacy_accounts(&connection)?;
     let mut collector_changed = false;
     let mut startup_paths = discover_rollout_files(None);
@@ -2295,6 +2302,12 @@ pub fn collect_rollouts(app: &tauri::AppHandle<tauri::Wry>) -> Result<bool, Stri
             ),
         }
     }
+    let Some(account_key) = observed_account else {
+        // The source cursor and unresolved ledger are still durable, but no
+        // account-scoped derived data may be created without live identity.
+        return Ok(collector_changed);
+    };
+    recorder::ensure_account(&connection, &account_key, recorder::now_seconds())?;
     let files = discover_rollout_files_for_account(&connection, None, &account_key)?;
     let changed =
         collector_changed || rebuild_rollout_derived_data(&connection, &files, &account_key)?;
@@ -2303,6 +2316,33 @@ pub fn collect_rollouts(app: &tauri::AppHandle<tauri::Wry>) -> Result<bool, Stri
     }
     refresh_account_health_after_collection(&connection, &account_key)?;
     Ok(changed)
+}
+
+/// Rebuild one account through the collector writer boundary. The UI may
+/// request this through IPC, but it never receives a writable SQLite handle.
+pub fn rebuild_account(
+    app: &tauri::AppHandle<tauri::Wry>,
+    account_key: &str,
+) -> Result<(), String> {
+    if is_unresolved_account_key(account_key) {
+        return Err("unresolved sources cannot be rebuilt as an account".into());
+    }
+    let connection = db::open_database_for_collector(app)?;
+    rebuild_account_connection(&connection, account_key)
+}
+
+pub fn rebuild_account_connection(
+    connection: &Connection,
+    account_key: &str,
+) -> Result<(), String> {
+    if is_unresolved_account_key(account_key) {
+        return Err("unresolved sources cannot be rebuilt as an account".into());
+    }
+    let files = discover_rollout_files_for_account(&connection, None, account_key)?;
+    let _ = rebuild_rollout_derived_data(&connection, &files, account_key)?;
+    super::quota::rebuild_account_intervals(&connection, account_key)?;
+    refresh_account_health_after_collection(&connection, account_key)?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -160,7 +160,7 @@ impl CollectorSessionGuard {
         Self::start_with_lock(connection, database_path, lock, now)
     }
 
-    fn start_with_lock(
+    pub fn start_with_lock(
         connection: &Connection,
         database_path: impl Into<PathBuf>,
         lock: CollectorLock,
@@ -820,7 +820,11 @@ fn source_binding(
 /// sources after a restart or an archive/root-layout change.
 pub fn registered_source_paths(connection: &Connection) -> Result<Vec<PathBuf>, String> {
     let mut statement = connection
-        .prepare("SELECT canonical_path FROM rollout_sources ORDER BY source_id")
+        // Source IDs are content hashes and intentionally do not encode the
+        // user-visible path. Keep service traversal deterministic by the
+        // canonical path instead of hash ordering, so per-source account
+        // evidence cannot be assigned by an unstable source-id order.
+        .prepare("SELECT canonical_path FROM rollout_sources ORDER BY canonical_path")
         .map_err(|error| error.to_string())?;
     let rows = statement
         .query_map([], |row| row.get::<_, String>(0))

@@ -4,6 +4,8 @@ use tauri::{AppHandle, Emitter, Wry};
 pub mod analytics;
 pub mod category_usage;
 pub mod collector_core;
+pub mod collector_ipc;
+pub mod collector_service;
 pub mod db;
 pub mod models;
 pub mod quota;
@@ -14,7 +16,7 @@ pub mod rollout;
 pub mod scheduler;
 
 pub use models::{AccountScope, CategoryUsage, UsageAnalytics, UsageAnalyticsQuery};
-pub use scheduler::{UsageRefreshScheduler, UsageSchedulerState, UsageSchedulerStatus};
+pub use scheduler::UsageSchedulerStatus;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +36,11 @@ pub fn emit_usage_data_invalidated(app: &AppHandle<Wry>, reason: &str) {
             reason: reason.into(),
             invalidated_at,
         },
+    );
+    collector_ipc::emit_event(
+        app,
+        collector_ipc::EVENT_USAGE_INVALIDATED,
+        serde_json::json!({"reason": reason, "invalidatedAt": invalidated_at}),
     );
 }
 

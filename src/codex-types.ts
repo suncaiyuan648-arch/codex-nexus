@@ -57,6 +57,8 @@ export interface UsageResult {
 }
 
 export interface CodexAccount {
+  id?: string | null;
+  accountId?: string | null;
   email: string | null;
   planType: string | null;
   type?: string | null;
@@ -75,6 +77,8 @@ export type CodexAccountState =
 export interface CodexSnapshot {
   codexPath: string;
   fetchedAt: number;
+  refreshGeneration?: number;
+  codexGeneration?: number;
 
   account: AccountReadResult  | null;
   accountError: string | null;
@@ -82,6 +86,7 @@ export interface CodexSnapshot {
   accountState: CodexAccountState;
 
   rateLimits: RateLimitsResult | null;
+  rateLimitsError?: string | null;
 
   usage: UsageResult | null;
   usageError: string | null;
@@ -126,6 +131,9 @@ export interface CodexConnectionStatus {
   lastError: string | null;
 
   codexPath: string | null;
+
+  /** True when the proxy could not reach the independent Collector. */
+  collectorUnavailable?: boolean;
 }
 
 export interface MonitorSettings {
@@ -150,9 +158,78 @@ export interface UsageSchedulerStatus {
   lastLocalActivityAt: number | null;
   refreshing: boolean;
   refreshReason: string | null;
+  refreshError: string | null;
   refreshStartedAt: number | null;
   refreshGeneration: number | null;
   queuedRefresh: boolean;
+}
+
+export type CollectorRuntimeStatus = "running" | "reconnecting" | "unavailable";
+
+export interface CollectorStatus {
+  status: CollectorRuntimeStatus;
+  instanceId: string | null;
+  pid: number | null;
+  startedAt: number | null;
+  heartbeatAt: number | null;
+  heartbeatAgeMs: number | null;
+  version: string | null;
+  transport: "unix_socket" | "named_pipe" | string;
+  endpoint: string;
+}
+
+export interface CollectorStatusEnvelope {
+  collector: CollectorStatus;
+  scheduler: UsageSchedulerStatus;
+  codex?: CodexConnectionStatus;
+}
+
+export interface CollectorSourceHealth {
+  sourceId: string;
+  path: string;
+  accountKey: string | null;
+  bindingStatus: "verified" | "inferred" | "unresolved" | "quarantined" | string;
+  bindingSource: string;
+  healthStatus: string;
+  lastOffset: number;
+  lastSize: number;
+  lastActivityAt: number | null;
+  lastError: string | null;
+}
+
+export interface CollectorGapDiagnostic {
+  startAt: number;
+  endAt: number;
+  durationMs: number;
+  reason: string;
+}
+
+export interface CollectorRateLimitSample {
+  accountKey: string;
+  sampledAt: number;
+  limitId: string;
+  window: string;
+  usedPercent: number;
+  resetsAt: number | null;
+}
+
+export interface CollectorTokenSample {
+  accountKey: string;
+  threadId: string;
+  turnId: string;
+  sampledAt: number;
+  deltaTokens: number;
+  cumulativeTokens: number;
+}
+
+export interface CollectorDataHealth {
+  collector: CollectorStatus;
+  sources: CollectorSourceHealth[];
+  unresolvedSourceCount: number;
+  gaps: CollectorGapDiagnostic[];
+  latestRateLimitSamples: CollectorRateLimitSample[];
+  latestTokenSamples: CollectorTokenSample[];
+  accounts: AccountDataHealth[];
 }
 
 export interface UsageRefreshCompletedPayload {
@@ -199,6 +276,10 @@ export interface CategoryTokenEstimate {
   observedTokens: number;
   observedQuotaPercent: number;
   cumulativeObservedQuotaDelta: number;
+  unattributedQuotaPercent: number;
+  observationGapMs: number;
+  gapTokenCount: number;
+  sampleQuality: "exact" | "bounded_gap" | "long_gap" | "unresolved" | string;
   coverageRatio: number;
   preObservationTokens: number;
   eligibleTokens: number;

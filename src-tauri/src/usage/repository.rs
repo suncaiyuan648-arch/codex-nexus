@@ -60,7 +60,6 @@ impl Aggregate {
 #[derive(Clone, Debug)]
 struct IntervalRow {
     account_key: String,
-    start_at: i64,
     end_at: i64,
     observed_delta_percent: f64,
 }
@@ -296,7 +295,6 @@ fn load_intervals(
         .query_map(params![start, end], |row| {
             Ok(IntervalRow {
                 account_key: row.get(0)?,
-                start_at: row.get(1)?,
                 end_at: row.get(2)?,
                 observed_delta_percent: row.get(3)?,
             })
@@ -457,8 +455,7 @@ pub fn query(
         .collect();
     let mut account_data: HashMap<String, (i64, Option<f64>, i64, BTreeSet<String>)> =
         HashMap::new();
-    let mut turn_category: HashMap<usize, String> = HashMap::new();
-    for (index, turn) in turns.iter().enumerate() {
+    for turn in &turns {
         let date = date_for(turn.started_at, offset);
         let credits = credits_for(&card, turn);
         let entry = daily.entry(date.clone()).or_default();
@@ -469,8 +466,6 @@ pub fn query(
         if let Some(value) = credits {
             entry.estimated_credits = Some(entry.estimated_credits.unwrap_or(0.0) + value);
         }
-        let category = category_for(&request.breakdown, turn);
-        turn_category.insert(index, category.clone());
         add_turn_tokens(&mut entry.categories, &request.breakdown, turn, credits);
         let account =
             account_data
@@ -502,49 +497,14 @@ pub fn query(
     }
 
     for interval in &intervals {
-        let local_indices: Vec<usize> = turns
-            .iter()
-            .enumerate()
-            .filter(|(_, turn)| {
-                turn.account_key == interval.account_key
-                    && turn.started_at > interval.start_at
-                    && turn.started_at <= interval.end_at
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let local_credits: f64 = local_indices
-            .iter()
-            .filter_map(|index| credits_for(&card, &turns[*index]))
-            .sum();
-        if local_credits > 0.0 {
-            for index in local_indices {
-                let turn = &turns[index];
-                let contribution = interval.observed_delta_percent
-                    * credits_for(&card, turn).unwrap_or(0.0)
-                    / local_credits;
-                let date = date_for(turn.started_at, offset);
-                let entry = daily.entry(date).or_default();
-                entry.attributable_quota_percent += contribution;
-                if let Some(category) = turn_category.get(&index) {
-                    entry
-                        .categories
-                        .entry(category.clone())
-                        .or_default()
-                        .attributed_quota_percent += contribution;
-                }
-            }
-        } else {
-            let date = date_for(interval.end_at, offset);
-            let entry = daily.entry(date).or_default();
-            entry.unattributed_quota_percent += interval.observed_delta_percent;
-            entry
-                .categories
-                .entry("Unattributed".into())
-                .or_default()
-                .attributed_quota_percent += interval.observed_delta_percent;
-        }
+        // Official quota is an account/window observation. Local credits do
+        // not identify which turn consumed that delta, so never distribute
+        // it proportionally across turns or categories. Keep it at the
+        // account/day level as explicitly unattributed instead.
         let date = date_for(interval.end_at, offset);
-        daily.entry(date).or_default().observed_quota_percent += interval.observed_delta_percent;
+        let entry = daily.entry(date).or_default();
+        entry.observed_quota_percent += interval.observed_delta_percent;
+        entry.unattributed_quota_percent += interval.observed_delta_percent;
     }
     for entry in daily.values_mut() {
         entry.unattributed_quota_percent += (entry.observed_quota_percent
@@ -934,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_quota_is_attributed_by_credits_and_not_raw_tokens() {
+    fn observed_quota_remains_account_level_and_unattributed() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
         insert_account(&connection, "a");
@@ -962,7 +922,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.summary.observed_quota_percent, Some(1.0));
-        assert_eq!(result.summary.attributable_quota_percent, Some(1.0));
-        assert_eq!(result.summary.unattributed_quota_percent, None);
+        assert_eq!(result.summary.attributable_quota_percent, None);
+        assert_eq!(result.summary.unattributed_quota_percent, Some(1.0));
+        assert!(result
+            .breakdown_items
+            .iter()
+            .all(|item| item.attributed_quota_percent.is_none()));
     }
 }

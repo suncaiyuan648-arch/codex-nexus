@@ -79,6 +79,68 @@ pub fn snapshot_account_key(snapshot: &Value) -> String {
     format!("local:{}", auth_identity)
 }
 
+/// Return an account key only when the snapshot carries account ownership
+/// evidence. A signed-out/partial response deliberately returns `None`; its
+/// `local:*` display key is not an account identity and must never be used to
+/// inherit the previous durable account.
+pub fn explicit_snapshot_account_key(snapshot: &Value) -> Option<String> {
+    let key = snapshot_account_key(snapshot);
+    (!key.starts_with("local:")).then_some(key)
+}
+
+fn unresolved_snapshot_account_key(snapshot: &Value) -> String {
+    let auth_identity = snapshot
+        .get("codexPath")
+        .and_then(Value::as_str)
+        .unwrap_or("codex")
+        .trim()
+        .to_ascii_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(auth_identity.as_bytes());
+    format!("unresolved:official:{}", hex::encode(hasher.finalize()))
+}
+
+/// Close any account presence interval when account/read itself is
+/// unavailable. This is deliberately independent of rate-limit and usage
+/// RPCs: a successful secondary RPC must never keep an old account current.
+/// The transaction makes the old-identity close and unresolved fence one
+/// durable operation.
+pub fn record_account_identity_unavailable_connection(
+    connection: &Connection,
+    codex_path: Option<&str>,
+    observed_at: i64,
+) -> Result<(), String> {
+    let snapshot = serde_json::json!({
+        "codexPath": codex_path.unwrap_or_default(),
+    });
+    let unresolved_key = unresolved_snapshot_account_key(&snapshot);
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    ensure_account(&transaction, &unresolved_key, observed_at)?;
+    let current_started_at: Option<i64> = transaction
+        .query_row(
+            "SELECT started_at FROM account_presence_intervals
+             WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let fence_at = current_started_at
+        .map(|started_at| observed_at.max(started_at.saturating_add(1)))
+        .unwrap_or(observed_at);
+    super::collector_core::record_account_presence(
+        &transaction,
+        &unresolved_key,
+        fence_at,
+        "account_read_unavailable",
+        "unknown",
+        None,
+    )?;
+    transaction.commit().map_err(|error| error.to_string())
+}
+
 pub fn record_account_snapshot(
     connection: &Connection,
     snapshot: &Value,
@@ -129,12 +191,40 @@ pub fn record_official_snapshot(
     snapshot: &Value,
 ) -> Result<(), String> {
     let connection = db::open_database_for_collector(app)?;
-    let account_key = snapshot_account_key(snapshot);
-    let account_key = if account_key.starts_with("local:") {
-        current_account_key(&connection)?.unwrap_or(account_key)
-    } else {
-        account_key
-    };
+    record_official_snapshot_connection(&connection, snapshot)
+}
+
+/// Persist an official snapshot on an already-open collector writer
+/// connection. This keeps the standalone collector on the same durable data
+/// plane without requiring a Tauri AppHandle.
+pub fn record_official_snapshot_connection(
+    connection: &Connection,
+    snapshot: &Value,
+) -> Result<(), String> {
+    // No official/rate-limit/usage row is durable until all three RPC
+    // results are present, error-free, and signed-in. A partial response may
+    // update only the identity fence, never account usage or quota samples.
+    if !crate::snapshot_is_complete_signed_in(snapshot) {
+        let fetched_at = timestamp(snapshot.get("fetchedAt"));
+        if let Some(account_key) = explicit_snapshot_account_key(snapshot) {
+            let transaction = connection
+                .unchecked_transaction()
+                .map_err(|error| error.to_string())?;
+            record_account_snapshot(&transaction, snapshot, &account_key, fetched_at)?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        return record_account_identity_unavailable_connection(
+            connection,
+            snapshot.get("codexPath").and_then(Value::as_str),
+            fetched_at,
+        );
+    }
+    // Never fall back to `current_account_key` here. Official data without a
+    // stable id/email is signed-out or otherwise identity-ambiguous and must
+    // remain unresolved instead of being written to the last account.
+    let account_key = explicit_snapshot_account_key(snapshot)
+        .unwrap_or_else(|| unresolved_snapshot_account_key(snapshot));
     let fetched_at = timestamp(snapshot.get("fetchedAt"));
     let transaction = connection
         .unchecked_transaction()
@@ -185,6 +275,13 @@ pub fn record_rate_limit_update(
     payload: &Value,
 ) -> Result<(), String> {
     let connection = db::open_database_for_collector(app)?;
+    record_rate_limit_update_connection(&connection, payload)
+}
+
+pub fn record_rate_limit_update_connection(
+    connection: &Connection,
+    payload: &Value,
+) -> Result<(), String> {
     let Some(account_key) = current_account_key(&connection)? else {
         return Ok(());
     };
@@ -375,25 +472,15 @@ pub fn record_thread_usage_failure(
 pub fn current_account_key(connection: &Connection) -> Result<Option<String>, String> {
     let account: Option<String> = connection
         .query_row(
-            "SELECT COALESCE(
-               (SELECT account_key FROM account_presence_intervals
-                WHERE ended_at IS NULL
-                  AND account_key NOT LIKE 'unresolved:%'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM account_usage_data_versions h
-                    WHERE h.account_key = account_presence_intervals.account_key
-                      AND h.status = 'legacy_unverified'
-                  )
-                ORDER BY started_at DESC LIMIT 1),
-               (SELECT account_key FROM accounts
-                WHERE account_key NOT LIKE 'unresolved:%'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM account_usage_data_versions h
-                    WHERE h.account_key = accounts.account_key
-                      AND h.status = 'legacy_unverified'
-                  )
-                ORDER BY last_seen_at DESC LIMIT 1)
-             )",
+            "SELECT account_key FROM account_presence_intervals
+             WHERE ended_at IS NULL
+               AND account_key NOT LIKE 'unresolved:%'
+               AND NOT EXISTS (
+                 SELECT 1 FROM account_usage_data_versions h
+                 WHERE h.account_key = account_presence_intervals.account_key
+                   AND h.status = 'legacy_unverified'
+               )
+             ORDER BY started_at DESC LIMIT 1",
             [],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -401,6 +488,25 @@ pub fn current_account_key(connection: &Connection) -> Result<Option<String>, St
         .map_err(|error| error.to_string())?
         .flatten();
     Ok(account.filter(|key| !is_unresolved_account_key(key)))
+}
+
+pub fn account_presence_covers(
+    connection: &Connection,
+    account_key: &str,
+    observed_at: i64,
+) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM account_presence_intervals
+               WHERE account_key = ?1
+                 AND started_at <= ?2
+                 AND (ended_at IS NULL OR ended_at >= ?2)
+             )",
+            params![account_key, observed_at],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())
 }
 
 pub fn pending_thread_usage_threads(
@@ -633,6 +739,145 @@ mod tests {
             snapshot_account_key(&same_email)
         );
         assert!(snapshot_account_key(&email).starts_with("sha256:"));
+    }
+
+    #[test]
+    fn signed_out_snapshot_does_not_fall_back_to_previous_account() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        ensure_account(&connection, "account:old", 10).unwrap();
+        super::super::collector_core::record_account_presence(
+            &connection,
+            "account:old",
+            10,
+            "account_read",
+            "high",
+            None,
+        )
+        .unwrap();
+
+        let snapshot = json!({
+            "codexPath": "/tmp/codex",
+            "fetchedAt": 20_000,
+            "account": null,
+            "accountState": "signedOut",
+            "rateLimits": {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {
+                            "windowDurationMins": 10080,
+                            "usedPercent": 42.0,
+                            "resetsAt": 99
+                        }
+                    }
+                }
+            },
+            "usage": {
+                "dailyUsageBuckets": [{"startDate": "2026-08-20", "tokens": 123}]
+            }
+        });
+        record_official_snapshot_connection(&connection, &snapshot).unwrap();
+
+        let old_samples: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM rate_limit_samples WHERE account_key = 'account:old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_samples, 0);
+        let unresolved: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM account_daily_usage WHERE account_key LIKE 'unresolved:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 0);
+        assert_eq!(current_account_key(&connection).unwrap(), None);
+        record_rate_limit_update_connection(&connection, &snapshot).unwrap();
+        let unresolved_samples: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM rate_limit_samples WHERE account_key LIKE 'unresolved:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved_samples, 0);
+        let old_samples_after_update: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM rate_limit_samples WHERE account_key = 'account:old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_samples_after_update, 0);
+    }
+
+    #[test]
+    fn account_read_transport_failure_fences_presence_without_rebuilding_old_account() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        ensure_account(&connection, "account:old", 10).unwrap();
+        super::super::collector_core::record_account_presence(
+            &connection,
+            "account:old",
+            10,
+            "account_read",
+            "high",
+            None,
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rate_limit_samples
+                 (account_key, sampled_at, limit_id, window, window_duration_mins,
+                  used_percent, resets_at, source, confidence)
+                 VALUES ('account:old', 10, 'codex', 'primary', 10080, 10, 99, 'official', 'high'),
+                        ('account:old', 20, 'codex', 'primary', 10080, 20, 99, 'official', 'high'),
+                        ('account:old', 30, 'codex', 'primary', 10080, 30, 99, 'official', 'high')",
+                [],
+            )
+            .unwrap();
+        quota::refresh_intervals(&connection, "account:old", "codex", "primary").unwrap();
+        let old_interval_id: i64 = connection
+            .query_row(
+                "SELECT id FROM quota_intervals WHERE account_key = 'account:old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        record_account_identity_unavailable_connection(&connection, Some("/tmp/codex"), 20)
+            .unwrap();
+
+        assert_eq!(current_account_key(&connection).unwrap(), None);
+        let old_ended: Option<i64> = connection
+            .query_row(
+                "SELECT ended_at FROM account_presence_intervals
+                 WHERE account_key = 'account:old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(old_ended.is_some());
+        let unresolved_source: String = connection
+            .query_row(
+                "SELECT source FROM account_presence_intervals
+                 WHERE ended_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved_source, "account_read_unavailable");
+        let remaining_interval_id: i64 = connection
+            .query_row(
+                "SELECT id FROM quota_intervals WHERE account_key = 'account:old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_interval_id, old_interval_id);
     }
 
     #[test]

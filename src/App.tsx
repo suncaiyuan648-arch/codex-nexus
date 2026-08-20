@@ -24,12 +24,14 @@ import type {
   MonitorSettings,
   RateLimitsUpdatedPayload,
   UsageDataInvalidatedPayload,
-  UsageRefreshCompletedPayload,
   UsageAnalytics,
   UsageBreakdown,
   UsageRange,
   UsageSchedulerStatus,
+  CollectorDataHealth,
 } from "./codex-types";
+
+import { collectorIpc } from "./collector-ipc";
 
 import {
   mergeRateLimitsUpdate,
@@ -84,6 +86,14 @@ function estimatorReasonLabel(value: string): string {
       return "账号数据正在重建";
     case "source_incomplete":
       return "Token 采集尚未追平";
+    case "long_observation_gap":
+      return "long gap，估算已阻断";
+    case "unresolved_source":
+      return "存在 unresolved source，未进入估算";
+    case "short_observation_gap":
+      return "短 observation gap，置信度降低";
+    case "unattributed_quota_delta":
+      return "额度变化无法直接归因到分类";
     case "boundary_overlap":
       return "boundary overlap 太多";
     case "boundary_ambiguity":
@@ -312,6 +322,9 @@ function WeeklyTokenEstimateSection({ usage }: { usage: CategoryUsage | null }) 
                       <span>样本离散度</span><strong>{Number.isFinite(estimate.dispersionRatio) ? `${(estimate.dispersionRatio * 100).toFixed(1)}%` : "不可计算"}</strong>
                       <span>预观测 Token</span><strong>{formatNumber(estimate.preObservationTokens)}</strong>
                       <span>可归因 Token</span><strong>{formatNumber(estimate.eligibleTokens)}</strong>
+                      <span>Observation gap</span><strong>{estimate.observationGapMs > 0 ? `${Math.ceil(estimate.observationGapMs / 1000)} 秒 · ${estimate.sampleQuality}` : "exact"}</strong>
+                      <span>Gap 内 Token</span><strong>{formatNumber(estimate.gapTokenCount)}</strong>
+                      <span>Unattributed quota</span><strong>{estimate.unattributedQuotaPercent.toFixed(2)}%</strong>
                     </div>
                     {estimate.hardBlockers.length ? (
                       <div className="quota-estimate-diagnostics-reasons">
@@ -471,8 +484,8 @@ function HomeUsageBreakdown({
       setLoading(true);
       try {
         const [today, weekly] = await Promise.all([
-          invoke<CategoryUsage>("get_category_usage", { period: "day" }),
-          invoke<CategoryUsage>("get_category_usage", { period: "quota_week" }),
+          collectorIpc.categoryUsage("day"),
+          collectorIpc.categoryUsage("quota_week"),
         ]);
         if (loadState.current.mounted) {
           setTodayUsage(today);
@@ -519,6 +532,153 @@ function HomeUsageBreakdown({
       )}
       <TodayCodexUsageCard usage={todayUsage} loading={loading} />
     </div>
+  );
+}
+
+function CollectorHealthPanel({ reloadToken }: { reloadToken: number }) {
+  const [health, setHealth] = useState<CollectorDataHealth | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [currentAccountKey, setCurrentAccountKey] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const nextHealth = await collectorIpc.dataHealth();
+      setHealth(nextHealth);
+      if (nextHealth.collector.status !== "running") {
+        setCurrentAccountKey(null);
+      } else {
+        try {
+          setCurrentAccountKey((await collectorIpc.categoryUsage("day")).accountKey);
+        } catch {
+          setCurrentAccountKey(null);
+        }
+      }
+      setLoadError(null);
+    } catch (error) {
+      setHealth(null);
+      setCurrentAccountKey(null);
+      setLoadError(String(error));
+      console.error("[UI] collector health load failed:", error);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    let disposed = false;
+    const eventNames = [
+      "collector://usage-invalidated",
+      "collector://rate-limit-updated",
+      "collector://account-updated",
+      "collector://health",
+      "collector://rebuild-progress",
+    ];
+    const unlisten: Array<() => void> = [];
+    const setupListeners = async () => {
+      for (const name of eventNames) {
+        const stop = await listen(name, () => {
+          if (!disposed) void load();
+        });
+        if (disposed) {
+          // `listen` resolves after cleanup in a fast unmount race. Remove
+          // the just-created native listener immediately instead of waiting
+          // for another render or leaking it until the next event.
+          stop();
+        } else {
+          unlisten.push(stop);
+        }
+      }
+    };
+    void setupListeners().catch((listenerError) => {
+      if (!disposed) {
+        setLoadError(String(listenerError));
+      }
+    });
+    return () => {
+      disposed = true;
+      while (unlisten.length > 0) {
+        unlisten.pop()?.();
+      }
+    };
+  }, [load, reloadToken]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => void load(), 5_000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  const collector = health?.collector;
+  const statusLabel = collector?.status === "running"
+    ? "Collector Running"
+    : collector?.status === "reconnecting"
+      ? "Collector Reconnecting"
+      : "Collector Unavailable";
+  const unresolved = health?.unresolvedSourceCount ?? 0;
+  const latestGap = health?.gaps[0];
+  const accountHealth = currentAccountKey
+    ? health?.accounts.find((account) => account.accountKey === currentAccountKey)
+    : undefined;
+  const rebuild = async () => {
+    if (!accountHealth) return;
+    setRebuilding(true);
+    try {
+      await collectorIpc.rebuildAccount(accountHealth.accountKey);
+      setRebuildError(null);
+      await load();
+    } catch (error) {
+      setRebuildError(String(error));
+      console.error("[UI] account rebuild failed:", error);
+    } finally {
+      setRebuilding(false);
+    }
+  };
+
+  return (
+    <section className="status-card collector-health-card" role="status" aria-live="polite" aria-atomic="true">
+      <div className="row quota-head">
+        <div>
+          <div className="eyebrow">数据平面健康</div>
+          <h2>{statusLabel}</h2>
+        </div>
+        <span className="muted tiny">{loading ? "读取中…" : collector?.transport ?? "IPC"}</span>
+      </div>
+      <div className="collector-health-grid">
+        <span>Source health</span>
+        <strong>{unresolved ? `${unresolved} 个 unresolved` : "无 unresolved source"}</strong>
+        <span>Gap diagnostics</span>
+        <strong>{latestGap ? `${latestGap.reason} · ${Math.ceil(latestGap.durationMs / 1000)} 秒` : "无已记录 gap"}</strong>
+        <span>Estimator / account data</span>
+        <strong>{accountHealth?.status ?? "insufficient_data"}</strong>
+        <span>Latest samples</span>
+        <strong>{health?.latestTokenSamples.length ?? 0} token · {health?.latestRateLimitSamples.length ?? 0} rate-limit</strong>
+      </div>
+      {health && health.accounts.length > 1 ? (
+        <p className="muted tiny collector-account-health-list">
+          账号健康：{health.accounts.map((account) => `${account.accountKey}=${account.status}`).join(" · ")}
+        </p>
+      ) : null}
+      {collector?.status !== "running" ? (
+        <p className="quota-estimate-warning">Collector 状态与页面/Codex 连接分开显示；当前只是采集器不可用或正在重连。</p>
+      ) : null}
+      {unresolved > 0 ? (
+        <p className="quota-estimate-warning">存在无法证明账号归属的 source，已保留数据但不会进入 estimator。</p>
+      ) : null}
+      {latestGap ? (
+        <p className="quota-estimate-warning">最近 gap 会降低 confidence；超过 5 分钟的 long gap 会阻断对应估算。</p>
+      ) : null}
+      {loadError ? <p className="quota-estimate-warning">无法读取 Collector health：{loadError}</p> : null}
+      {rebuildError ? <p className="quota-estimate-warning">账号重建失败：{rebuildError}</p> : null}
+      {currentAccountKey && accountHealth && accountHealth.status !== "verified" ? (
+        <button className="secondary-button" aria-label={`重建账号 ${accountHealth.accountKey} 数据`} onClick={() => void rebuild()} disabled={rebuilding}>
+          {rebuilding ? "重建中…" : "通过 Collector 重建账号数据"}
+        </button>
+      ) : null}
+    </section>
   );
 }
 
@@ -954,6 +1114,47 @@ function buildLastDays(
   return result;
 }
 
+function isFreshSignedInSnapshot(
+  snapshot: CodexSnapshot | null,
+  connection: CodexConnectionStatus | null,
+  scheduler: UsageSchedulerStatus | null,
+): snapshot is CodexSnapshot {
+  const account = snapshot?.account?.account;
+  const stableAccountEvidence = Boolean(
+    account
+      && ((typeof account.id === "string" && account.id.trim().length > 0)
+        || (typeof account.accountId === "string" && account.accountId.trim().length > 0)
+        || (typeof account.email === "string" && account.email.trim().length > 0)),
+  );
+  const rateLimitsComplete = Boolean(
+    snapshot?.rateLimits
+      && (snapshot.rateLimits.rateLimitsByLimitId != null
+        || snapshot.rateLimits.rateLimits != null),
+  );
+  const usageComplete = Boolean(
+    snapshot?.usage
+      && snapshot.usage.dailyUsageBuckets !== undefined
+      && snapshot.usage.summary !== undefined,
+  );
+  return Boolean(
+    snapshot
+      && snapshot.accountState === "signedIn"
+      && stableAccountEvidence
+      && !snapshot.accountError
+      && rateLimitsComplete
+      && usageComplete
+      && !snapshot.rateLimitsError
+      && !snapshot.usageError
+      && connection?.phase === "ready"
+      && !connection.collectorUnavailable
+      && scheduler?.refreshing === false
+      && snapshot.refreshGeneration != null
+      && snapshot.refreshGeneration === scheduler.refreshGeneration
+      && snapshot.codexGeneration != null
+      && snapshot.codexGeneration === connection.generation,
+  );
+}
+
 /*
  * ============================================================
  * App
@@ -1020,7 +1221,6 @@ function App() {
 
   const [refreshing, setRefreshing] = useState(false);
   const pendingRefreshGeneration = useRef<number | null>(null);
-  const lastCompletedRefreshGeneration = useRef(0);
   const usageInvalidationTimer = useRef<number | null>(null);
 
   const [
@@ -1069,38 +1269,50 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    const setup = async () => {
-      unlisten = await listen<UsageRefreshCompletedPayload>(
-        "codex://usage-refresh-completed",
-        (event) => {
-          const payload = event.payload;
-          lastCompletedRefreshGeneration.current = Math.max(
-            lastCompletedRefreshGeneration.current,
-            payload.refreshGeneration,
-          );
-          if (disposed || pendingRefreshGeneration.current !== payload.refreshGeneration) {
-            return;
-          }
+    const poll = async () => {
+      try {
+        const envelope = await collectorIpc.status();
+        if (disposed) return;
+        setSchedulerStatus(envelope.scheduler);
+        if (envelope.scheduler.refreshing) {
+          setSnapshot(null);
+          setLoading(false);
+        }
+        const pending = pendingRefreshGeneration.current;
+        const completed = envelope.scheduler.refreshGeneration ?? 0;
+        if (envelope.scheduler.refreshError) {
+          pendingRefreshGeneration.current = null;
+          setSnapshot(null);
+          setRefreshing(false);
+          setLoading(false);
+          setError(`Collector refresh failed: ${envelope.scheduler.refreshError}`);
+          return;
+        }
+        if (pending !== null && !envelope.scheduler.refreshing && completed >= pending) {
           pendingRefreshGeneration.current = null;
           setRefreshing(false);
-          if (!payload.success && payload.error) {
-            setError(payload.error);
-          }
-        },
-      );
-    };
-
-    void setup().catch((setupError) => {
-      if (!disposed) {
-        console.error("[UI] refresh completion listener failed:", setupError);
+        }
+        if (envelope.collector.status !== "running") {
+          setSnapshot(null);
+          setLoading(false);
+          setError(`Collector ${envelope.collector.status}: health unavailable`);
+        }
+      } catch (error) {
+        if (disposed) return;
+        setSchedulerStatus(null);
+        setSnapshot(null);
+        pendingRefreshGeneration.current = null;
+        setRefreshing(false);
+        setLoading(false);
+        setError(`Collector refresh status unavailable: ${String(error)}`);
       }
-    });
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 500);
 
     return () => {
       disposed = true;
-      unlisten?.();
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -1142,7 +1354,7 @@ function App() {
       }
       currentDayKey = nextDayKey;
       scheduleUsageDataReload();
-      void invoke<number>("refresh_usage_now").catch((refreshError) => {
+      void collectorIpc.refreshNow().catch((refreshError) => {
         console.error("[UI] local-day refresh request failed:", refreshError);
       });
     };
@@ -1211,22 +1423,21 @@ function App() {
    * Snapshot Refresh
    * ==========================================================
    *
-   * React 只触发一次显式刷新请求；真正的 RPC 与数据事件由 Rust
-   * UsageRefreshScheduler 执行。
+   * React 只触发一次显式刷新请求；真正的 RPC、watcher 与写入由独立
+   * nexus-collector 执行，Tauri 只做代理。
    */
   const refresh =
     useCallback(
       async () => {
         try {
           setRefreshing(true);
+          // Clear immediately; the collector also clears its durable latest
+          // snapshot and reserves a new generation at REFRESH_NOW start.
+          setSnapshot(null);
           setError(null);
 
-          const generation = await invoke<number>("refresh_usage_now");
+          const generation = await collectorIpc.refreshNow();
           pendingRefreshGeneration.current = generation;
-          if (lastCompletedRefreshGeneration.current >= generation) {
-            pendingRefreshGeneration.current = null;
-            setRefreshing(false);
-          }
         } catch (error) {
           console.error(
             "[UI] snapshot refresh failed:",
@@ -1275,123 +1486,44 @@ function App() {
    *
    * 这部分负责：
    *
-   * Rust CodexRpcClient
-   *       ↓
-   * app.emit(
-   *   "codex://connection-state"
-   * )
-   *       ↓
-   * React listen()
-   *
-   *
-   * 同时解决一个重要竞态：
-   *
-   * Rust 可能已经 Ready
-   *      ↓
-   * React Listener 还没注册
-   *      ↓
-   * Ready Event 丢失
-   *
-   * 所以：
-   *
-   * ① 先注册 listener
-   * ② 再主动读取当前状态
+   * Collector 独立进程不依赖 Tauri event loop；GET_CODEX_STATUS 是
+   * 连接状态和 retry countdown 的权威来源。
    */
   useEffect(() => {
     let disposed = false;
-
-    let unlisten:
-      (() => void)
-      | undefined;
-
-    const setupConnectionListener =
-      async () => {
-        /*
-         * --------------------------------------
-         * 1. 先监听未来状态
-         * --------------------------------------
-         */
-        unlisten =
-          await listen<
-            CodexConnectionStatus
-          >(
-            "codex://connection-state",
-
-            (event) => {
-              if (disposed) {
-                return;
-              }
-
-              console.log(
-                "[UI] connection state:",
-                event.payload,
-              );
-
-              setConnection(
-                event.payload,
-              );
-
-            },
-          );
-
-        if (disposed) {
-          unlisten();
-          return;
-        }
-
-        /*
-         * --------------------------------------
-         * 2. 再读取当前状态
-         * --------------------------------------
-         *
-         * 避免 Ready Event 在 React
-         * listener 注册前已经发生。
-         */
-        try {
-          const status =
-            await invoke<
-              CodexConnectionStatus
-            >(
-              "get_codex_connection_status",
-            );
-
-          if (disposed) {
-            return;
-          }
-
-          console.log(
-            "[UI] initial connection state:",
-            status,
-          );
-
-          setConnection(
-            status,
-          );
-
-          const cached = await invoke<CodexSnapshot | null>(
-            "get_cached_codex_snapshot",
-          );
-          if (cached && !disposed) {
-            setSnapshot(cached);
-            setAnalyticsReloadToken((value) => value + 1);
+    const pollStatus = async () => {
+      try {
+        const status = await invoke<CodexConnectionStatus>("get_codex_connection_status");
+        if (!disposed) {
+          setConnection(status);
+          if (status.collectorUnavailable || status.phase !== "ready") {
+            setSnapshot(null);
             setLoading(false);
           }
-        } catch (error) {
-          console.error(
-            "[UI] failed to read connection status:",
-            error,
-          );
         }
-      };
-
-    void setupConnectionListener();
+      } catch (error) {
+        if (!disposed) {
+          setConnection({
+            phase: "disconnected",
+            generation: 0,
+            attempt: 0,
+            retryInMs: null,
+            lastError: String(error),
+            codexPath: null,
+            collectorUnavailable: true,
+          });
+          setSnapshot(null);
+          setLoading(false);
+          setError(`Collector unavailable: ${String(error)}`);
+        }
+      }
+    };
+    void pollStatus();
+    const timer = window.setInterval(() => void pollStatus(), 1_000);
 
     return () => {
       disposed = true;
-
-      if (unlisten) {
-        unlisten();
-      }
+      window.clearInterval(timer);
     };
   }, []);
 
@@ -1408,38 +1540,17 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlistenSnapshot: (() => void) | undefined;
-    let unlistenScheduler: (() => void) | undefined;
+    let snapshotPoll: number | undefined;
 
     const setup = async () => {
-      unlistenSnapshot = await listen<CodexSnapshot>(
-        "codex://usage-snapshot",
-        (event) => {
-          if (disposed) {
-            return;
-          }
-          setSnapshot(event.payload);
-          setAnalyticsReloadToken((value) => value + 1);
-          setLoading(false);
-          setError(null);
-        },
-      );
-
-      unlistenScheduler = await listen<UsageSchedulerStatus>(
-        "codex://usage-refresh-state",
-        (event) => {
-          if (!disposed) {
-            setSchedulerStatus(event.payload);
-          }
-        },
-      );
-
       const cached = await invoke<CodexSnapshot | null>(
         "get_cached_codex_snapshot",
       );
-      if (cached && !disposed) {
-        setSnapshot(cached);
-        setAnalyticsReloadToken((value) => value + 1);
+      if (!disposed) {
+        setSnapshot(cached ?? null);
+        if (cached) {
+          setAnalyticsReloadToken((value) => value + 1);
+        }
         setLoading(false);
       }
 
@@ -1449,18 +1560,53 @@ function App() {
       if (!disposed) {
         setSchedulerStatus(currentSchedulerStatus);
       }
+
+      snapshotPoll = window.setInterval(() => {
+        void invoke<CodexSnapshot | null>("get_cached_codex_snapshot")
+          .then((latest) => {
+            if (!disposed) {
+              setSnapshot(latest ?? null);
+              if (latest) {
+                setAnalyticsReloadToken((value) => value + 1);
+              }
+              setLoading(false);
+            }
+          })
+          .catch((error) => {
+            if (!disposed) {
+              setSnapshot(null);
+              setLoading(false);
+              setError(`Collector snapshot unavailable: ${String(error)}`);
+            }
+          });
+        void collectorIpc.status()
+          .then((envelope) => {
+            if (!disposed) setSchedulerStatus(envelope.scheduler);
+          })
+          .catch((error) => {
+            if (!disposed) {
+              setSnapshot(null);
+              setSchedulerStatus(null);
+              setLoading(false);
+              setError(`Collector health unavailable: ${String(error)}`);
+            }
+          });
+      }, 5_000);
     };
 
     void setup().catch((setupError) => {
       if (!disposed) {
         console.error("[UI] usage event setup failed:", setupError);
+        setLoading(false);
+        setError(`Collector health unavailable: ${String(setupError)}`);
       }
     });
 
     return () => {
       disposed = true;
-      unlistenSnapshot?.();
-      unlistenScheduler?.();
+      if (snapshotPoll !== undefined) {
+        window.clearInterval(snapshotPoll);
+      }
     };
   }, []);
 
@@ -1566,11 +1712,10 @@ function App() {
           "[UI] rate-limit listener ready",
         );
 
-        if (
-          disposed
-          && unlisten
-        ) {
-          unlisten();
+        if (disposed && unlisten) {
+          const stop = unlisten;
+          unlisten = undefined;
+          stop();
         }
       };
 
@@ -1583,8 +1728,9 @@ function App() {
         console.log(
           "[UI] removing rate-limit listener",
         );
-
-        unlisten();
+        const stop = unlisten;
+        unlisten = undefined;
+        stop();
       }
     };
   }, []);
@@ -1612,19 +1758,23 @@ function App() {
    *
    * primary / secondary
    *
-   * 的具体含义。
-   */
+  * 的具体含义。
+  */
+  const renderableSnapshot = isFreshSignedInSnapshot(snapshot, connection, schedulerStatus)
+    ? snapshot
+    : null;
+
   const quotaWindows =
     useMemo(
       () =>
         normalizeRateLimits(
-          snapshot
+          renderableSnapshot
             ?.rateLimits
           ?? null,
         ),
 
       [
-        snapshot
+        renderableSnapshot
           ?.rateLimits,
       ],
     );
@@ -1642,7 +1792,7 @@ function App() {
    * ==========================================================
    */
   const usage =
-    snapshot?.usage;
+    renderableSnapshot?.usage;
 
   const today =
     useMemo(
@@ -1669,6 +1819,10 @@ function App() {
       () => {
         if (!connection) {
           return "启动中";
+        }
+
+        if (connection.collectorUnavailable) {
+          return "Collector 不可用";
         }
 
         switch (
@@ -1718,8 +1872,9 @@ function App() {
 
   const accountState:
     CodexAccountState =
-    snapshot?.accountState
-    ?? "unknown";
+    connectionReady && !connection?.collectorUnavailable
+      ? snapshot?.accountState ?? "unknown"
+      : "error";
 
   const accountText =
     useMemo(
@@ -1785,7 +1940,7 @@ function App() {
               className="muted small"
             >
               {
-                snapshot
+                renderableSnapshot
                   ?.account
                   ?.account
                   ?.email
@@ -1793,12 +1948,12 @@ function App() {
               }
 
               {
-                snapshot
+                renderableSnapshot
                   ?.account
                   ?.account
                   ?.planType
 
-                  ? ` · ${snapshot
+                  ? ` · ${renderableSnapshot
                     .account
                     .account
                     .planType
@@ -1868,6 +2023,8 @@ function App() {
         />
       ) : null}
 
+      <CollectorHealthPanel reloadToken={analyticsReloadToken} />
+
       {/*
        * ======================================================
        * Connection Error
@@ -1894,7 +2051,7 @@ function App() {
               className="error-card"
             >
               <strong>
-                Codex 连接已断开
+                {connection.collectorUnavailable ? "Collector 不可用" : "Codex 连接已断开"}
               </strong>
 
               <p>
@@ -2022,12 +2179,12 @@ function App() {
        * Dashboard
        * ======================================================
        *
-       * 即使断线，
-       * snapshot 仍然保留最后一次成功数据。
+       * 断线、signed-out 或 Collector 不可用时，必须等待新鲜的
+       * signed-in snapshot 才恢复额度与 usage 卡片。
        */}
 
       {
-        snapshot
+        renderableSnapshot
           ? (
             <>
               {/*
@@ -2059,13 +2216,13 @@ function App() {
               <UsageAnalyticsPanel reloadToken={analyticsReloadToken} />
 
               {
-                (snapshot.rateLimits?.rateLimitResetCredits?.availableCount ?? 0) > 0
+                (renderableSnapshot.rateLimits?.rateLimitResetCredits?.availableCount ?? 0) > 0
                   ? (
                     <section className="credit-card">
                       <div className="eyebrow">已获得的重置额度</div>
                       <div className="row">
                         <h2>
-                          {snapshot.rateLimits?.rateLimitResetCredits?.availableCount} 个重置额度可用
+                          {renderableSnapshot.rateLimits?.rateLimitResetCredits?.availableCount} 个重置额度可用
                         </h2>
                         <span className="muted small">V2 操作功能</span>
                       </div>
@@ -2206,8 +2363,8 @@ function App() {
       >
         <span>
           {
-            snapshot?.codexPath
-              ? `Codex: ${snapshot.codexPath
+            renderableSnapshot?.codexPath
+              ? `Codex: ${renderableSnapshot.codexPath
               }`
 
               : connection
@@ -2223,9 +2380,9 @@ function App() {
 
         <span>
           {
-            snapshot?.fetchedAt
+            renderableSnapshot?.fetchedAt
               ? `更新时间：${new Date(
-                snapshot
+                renderableSnapshot
                   .fetchedAt,
               )
                 .toLocaleTimeString()

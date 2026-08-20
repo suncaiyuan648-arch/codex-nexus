@@ -294,6 +294,12 @@ fn send_notification(app: &AppHandle<Wry>, title: String, body: String) {
 }
 
 pub fn process_snapshot(app: &AppHandle<Wry>, snapshot: &Value) {
+    // Notifications, settings transitions, and history are side effects.
+    // Do not let a partial or signed-out snapshot manufacture a zero/100%
+    // quota observation or notify against an old account.
+    if !crate::snapshot_is_complete_signed_in(snapshot) {
+        return;
+    }
     let _guard = lock();
     let mut settings = match load_settings_unlocked(app) {
         Ok(settings) => settings,

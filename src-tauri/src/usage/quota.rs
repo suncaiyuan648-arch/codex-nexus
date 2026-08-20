@@ -17,6 +17,82 @@ struct Sample {
     resets_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GapObservation {
+    duration_ms: i64,
+    token_count: i64,
+    quality: &'static str,
+}
+
+fn observation_gap(
+    connection: &Connection,
+    account_key: &str,
+    start_at: i64,
+    end_at: i64,
+) -> Result<GapObservation, String> {
+    let gaps: Vec<(i64, i64)> = connection
+        .prepare(
+            "SELECT start_at, end_at FROM collector_gaps
+             WHERE end_at > ?1 AND start_at < ?2 ORDER BY start_at",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map(params![start_at, end_at], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut duration_ms = 0_i64;
+    for (gap_start, gap_end) in gaps {
+        let start = gap_start.max(start_at);
+        let end = gap_end.min(end_at);
+        if end > start {
+            duration_ms =
+                duration_ms.saturating_add(end.saturating_sub(start).saturating_mul(1000));
+        }
+    }
+    let token_count = connection
+        .query_row(
+            "SELECT COALESCE(SUM(delta_tokens), 0) FROM turn_token_samples
+             WHERE account_key = ?1 AND sampled_at > ?2 AND sampled_at <= ?3
+               AND EXISTS (
+                 SELECT 1 FROM collector_gaps g
+                 WHERE g.end_at > ?2 AND g.start_at < ?3
+                   AND turn_token_samples.sampled_at > g.start_at
+                   AND turn_token_samples.sampled_at <= g.end_at
+               )",
+            params![account_key, start_at, end_at],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let unresolved = connection
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM rollout_sources
+               WHERE binding_status = 'unresolved'
+                 AND COALESCE(first_activity_at, first_seen_at) < ?2
+                 AND COALESCE(last_activity_at, first_seen_at) >= ?1
+             )",
+            params![start_at, end_at],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let quality = if unresolved {
+        "unresolved"
+    } else if duration_ms > 5 * 60 * 1000 {
+        "long_gap"
+    } else if duration_ms > 0 {
+        "bounded_gap"
+    } else {
+        "exact"
+    };
+    Ok(GapObservation {
+        duration_ms,
+        token_count,
+        quality,
+    })
+}
+
 pub fn same_reset_at(previous: Option<i64>, current: Option<i64>) -> bool {
     match (previous, current) {
         (Some(previous), Some(current)) => (current - previous).abs() <= RESET_AT_TOLERANCE_SECS,
@@ -119,29 +195,17 @@ fn insert_step(
     if delta <= 0.0 {
         return Ok(());
     }
-    let local_credits: Option<f64> = connection
-        .query_row(
-            "SELECT SUM(
-                       CASE WHEN t.raw_total_tokens > 0
-                            THEN t.estimated_credits * s.delta_tokens
-                                 / t.raw_total_tokens
-                            ELSE 0 END
-                   )
-             FROM turn_token_samples s
-             INNER JOIN turn_usage t
-               ON t.account_key = s.account_key
-              AND t.thread_id = s.thread_id
-              AND t.turn_id = s.turn_id
-             WHERE s.account_key = ?1
-               AND s.sampled_at > ?2 AND s.sampled_at <= ?3",
-            params![account_key, start.sampled_at, end.sampled_at],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    let confidence = if local_credits.unwrap_or(0.0) > 0.0 {
-        Confidence::Medium
-    } else {
-        Confidence::Low
+    // Quota percentage is account/window-level official usage. There is no
+    // direct category-level observation here, so never manufacture a model
+    // credit amount by weighting it with local Token deltas.
+    let local_credits: Option<f64> = None;
+    let unattributed_percent = Some(delta);
+    let confidence = Confidence::Low;
+    let gap = observation_gap(connection, account_key, start.sampled_at, end.sampled_at)?;
+    let confidence = match gap.quality {
+        "exact" => confidence,
+        "bounded_gap" => Confidence::Low,
+        _ => Confidence::Unknown,
     };
 
     connection
@@ -150,9 +214,10 @@ fn insert_step(
              (account_key, limit_id, window, window_duration_mins, cycle_id,
               start_sample_id, end_sample_id, start_at, end_at, start_percent,
               end_percent, observed_delta_percent, local_weighted_credits,
-              unattributed_percent, sample_quality, rejection_reason, confidence)
+              unattributed_percent, sample_quality, observation_gap_ms,
+              gap_token_count, rejection_reason, confidence)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     ?14, ?15, ?16, ?17)",
+                     ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 account_key,
                 limit_id,
@@ -167,12 +232,10 @@ fn insert_step(
                 end.used_percent,
                 delta,
                 local_credits,
-                if local_credits.unwrap_or(0.0) > 0.0 {
-                    Some(0.0)
-                } else {
-                    Some(delta)
-                },
-                "quota_step",
+                unattributed_percent,
+                gap.quality,
+                gap.duration_ms,
+                gap.token_count,
                 Option::<String>::None,
                 confidence_string(&confidence),
             ],
@@ -302,6 +365,63 @@ mod tests {
     }
 
     #[test]
+    fn interval_records_gap_quality_and_tokens_without_splitting_quota_delta() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO collector_gaps
+                 (session_id, start_at, end_at, duration_ms, reason, created_at)
+                 VALUES ('s', 2, 3, 1000, 'os_sleep', 4)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO turn_token_samples
+                 (account_key, thread_id, turn_id, segment_no, reasoning_effort,
+                  speed_mode, sampled_at, cumulative_tokens, delta_tokens, source, confidence)
+                 VALUES ('a', 'thread', 'turn', 0, 'medium', 'standard', 3, 7, 7,
+                         'local_rollout', 'high')",
+                [],
+            )
+            .unwrap();
+        for (timestamp, used) in [(1, 10.0), (2, 11.0), (3, 11.0), (4, 12.0)] {
+            connection
+                .execute(
+                    "INSERT INTO rate_limit_samples
+                     (account_key, sampled_at, limit_id, window, window_duration_mins,
+                      used_percent, resets_at, source, confidence)
+                     VALUES ('a', ?1, 'codex', 'primary', 10080, ?2, 100, 'official', 'high')",
+                    params![timestamp, used],
+                )
+                .unwrap();
+        }
+        refresh_intervals(&connection, "a", "codex", "primary").unwrap();
+        let row: (String, i64, i64, String, String) = connection
+            .query_row(
+                "SELECT sample_quality, observation_gap_ms, gap_token_count,
+                        confidence, rejection_reason
+                 FROM quota_intervals",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("bounded_gap".into(), 1000, 7, "low".into(), "".into())
+        );
+    }
+
+    #[test]
     fn quota_step_contains_the_plateau_between_transitions() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
@@ -328,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_credits_follow_token_sample_time_not_turn_start_time() {
+    fn quota_delta_is_not_proportionally_assigned_to_local_credits() {
         let connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection).unwrap();
         connection
@@ -377,6 +497,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(local_credits, Some(6.0));
+        assert_eq!(local_credits, None);
+        let unattributed: f64 = connection
+            .query_row(
+                "SELECT unattributed_percent FROM quota_intervals",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unattributed, 1.0);
     }
 }

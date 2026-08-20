@@ -3,16 +3,47 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Wry};
 
 pub const DATABASE_FILE: &str = "usage.db";
 
+/// Keep the Tauri proxy and the OS-managed collector on one explicit path.
+/// Tauri's `app_data_dir` is derived from this identifier on every supported
+/// desktop platform; the standalone binary uses the same resolver without an
+/// AppHandle. `NEXUS_USAGE_DATABASE` is an installer/dev override and is also
+/// useful when an installation has to migrate an older location.
+pub const APP_IDENTIFIER: &str = "com.local.codexnexus";
+
+pub fn default_database_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("NEXUS_USAGE_DATABASE") {
+        return PathBuf::from(path);
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support")
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.clone())
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"))
+    };
+    base.join(APP_IDENTIFIER)
+        .join("Codex Usage Monitor")
+        .join(DATABASE_FILE)
+}
+
 fn database_directory(app: &AppHandle<Wry>) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("Codex Usage Monitor"))
+    let _ = app;
+    default_database_path()
+        .parent()
+        .map(PathBuf::from)
+        .ok_or_else(|| "usage database path has no parent directory".to_string())
 }
 
 /// Resolve the database path without changing the filesystem. Read-only UI
@@ -51,6 +82,42 @@ pub(crate) fn open_database_for_collector(app: &AppHandle<Wry>) -> Result<Connec
         return Err("collector writer token is not held".into());
     }
     open_database_rw(app)
+}
+
+/// Open and migrate the collector-owned database without a Tauri handle. The
+/// caller must hold `CollectorLock` before invoking this function.
+pub fn open_standalone_database(path: &Path) -> Result<Connection, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| error.to_string())?;
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .map_err(|error| error.to_string())?;
+    initialize_schema(&connection)?;
+    super::rollout::classify_legacy_accounts(&connection)?;
+    Ok(connection)
+}
+
+/// Read-only connection for the standalone service's IPC handlers. Keeping
+/// query traffic off the writer mutex means a slow Codex refresh cannot make
+/// GET_STATUS or health polling look like a dead collector.
+pub fn open_standalone_readonly(path: &Path) -> Result<Connection, String> {
+    if !path.is_file() {
+        return Err("usage database is not initialized".into());
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|error| error.to_string())?;
+    Ok(connection)
 }
 
 pub(crate) fn open_database_for_lock(
@@ -287,6 +354,8 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<(), String> {
                 local_weighted_credits REAL,
                 unattributed_percent REAL,
                 sample_quality TEXT NOT NULL DEFAULT 'quota_step',
+                observation_gap_ms INTEGER NOT NULL DEFAULT 0,
+                gap_token_count INTEGER NOT NULL DEFAULT 0,
                 rejection_reason TEXT,
                 confidence TEXT NOT NULL
             );
@@ -527,6 +596,8 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<(), String> {
         ("start_sample_id", "INTEGER"),
         ("end_sample_id", "INTEGER"),
         ("sample_quality", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("observation_gap_ms", "INTEGER NOT NULL DEFAULT 0"),
+        ("gap_token_count", "INTEGER NOT NULL DEFAULT 0"),
         ("rejection_reason", "TEXT"),
     ] {
         if table_exists(connection, "quota_intervals")?

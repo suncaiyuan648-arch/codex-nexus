@@ -101,6 +101,16 @@ The goal is to keep memory usage, CPU usage, and background activity low.
 
 ## 🚀 Current Features
 
+### Independent Collector lifecycle
+
+Usage collection is exposed through a local Collector service boundary. The UI uses a
+Tauri IPC proxy for status, refresh, account/category queries, health, and account rebuild;
+it does not write the usage database or manipulate the scheduler directly. On macOS/Linux
+the transport is a Unix Domain Socket beside `usage.db`; the Windows transport is reserved
+for a replaceable Named Pipe. See [docs/collector-development.md](docs/collector-development.md)
+for the two-terminal development flow, LaunchAgent/Startup Task templates, health states,
+gap semantics, and the Windows fail-closed transport status.
+
 ### Codex Rate Limit Monitor
 
 View the current Codex rate-limit window dynamically.

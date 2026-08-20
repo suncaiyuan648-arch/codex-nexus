@@ -1,12 +1,13 @@
 mod codex;
 mod monitor;
-mod usage;
+pub mod usage;
 
 use chrono::{Datelike, Local, TimeZone, Timelike};
 
 use codex::{CodexRpcClient, ConnectionStatus};
 
 use monitor::MonitorSettings;
+use usage::recorder;
 
 use serde_json::{json, Value};
 
@@ -20,7 +21,7 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Listener, Manager, State, WindowEvent, Wry,
+    AppHandle, Listener, Manager, State, WindowEvent, Wry,
 };
 use tauri_plugin_autostart::ManagerExt as AutoStartManagerExt;
 
@@ -35,8 +36,8 @@ const TRAY_ICON_BYTES: &[u8] = include_bytes!("../icons/tray/macos/tray@2x.png")
 
 const TRAY_ICON_IS_TEMPLATE: bool = cfg!(target_os = "macos");
 
-pub struct CodexState {
-    client: Arc<CodexRpcClient>,
+pub struct CollectorIpcState {
+    endpoint: std::path::PathBuf,
 }
 
 struct TrayDisplay {
@@ -58,23 +59,51 @@ struct TrayQuotaSummary {
 }
 
 #[tauri::command]
-fn get_codex_connection_status(state: State<'_, CodexState>) -> ConnectionStatus {
-    state.client.status()
+fn get_codex_connection_status(state: State<'_, CollectorIpcState>) -> ConnectionStatus {
+    usage::collector_ipc::request_path(&state.endpoint, "GET_CODEX_STATUS", Value::Null)
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_else(|| collector_unavailable_status("Collector unavailable"))
 }
 
-#[tauri::command]
-fn reconnect_codex(state: State<'_, CodexState>) -> Result<(), String> {
-    state.client.reconnect()
-}
-
-#[tauri::command]
-fn get_codex_snapshot(app: AppHandle<Wry>, state: State<'_, CodexState>) -> Result<Value, String> {
-    let snapshot = fetch_codex_snapshot(&state.client)?;
-    if let Err(error) = usage::record_official_snapshot(&app, &snapshot) {
-        eprintln!("[Usage] failed to record official snapshot: {}", error);
+fn collector_unavailable_status(error: impl Into<String>) -> ConnectionStatus {
+    ConnectionStatus {
+        phase: "disconnected".into(),
+        last_error: Some(error.into()),
+        collector_unavailable: true,
+        ..ConnectionStatus::default()
     }
+}
+
+#[tauri::command]
+fn reconnect_codex(state: State<'_, CollectorIpcState>) -> Result<(), String> {
+    usage::collector_ipc::request_path(&state.endpoint, "RECONNECT_CODEX", Value::Null)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_codex_snapshot(
+    app: AppHandle<Wry>,
+    state: State<'_, CollectorIpcState>,
+) -> Result<Value, String> {
+    let snapshot = current_collector_snapshot(&state.endpoint)?;
     monitor::process_snapshot(&app, &snapshot);
-    let _ = app.emit("codex://usage-snapshot", snapshot.clone());
+    Ok(snapshot)
+}
+
+fn current_collector_snapshot(endpoint: &std::path::PathBuf) -> Result<Value, String> {
+    let status = usage::collector_ipc::request_path(endpoint, "GET_STATUS", Value::Null)?;
+    let snapshot = usage::collector_ipc::request_path(endpoint, "GET_SNAPSHOT", Value::Null)?;
+    // The collector can begin a refresh between the first status read and
+    // GET_SNAPSHOT. Re-read authoritative status after the snapshot so a
+    // generation/identity invalidation cannot race this proxy into returning
+    // the previous quota to App or Tray.
+    let final_status = usage::collector_ipc::request_path(endpoint, "GET_STATUS", Value::Null)?;
+    if !snapshot_matches_collector_status(&snapshot, &status)
+        || !snapshot_matches_collector_status(&snapshot, &final_status)
+    {
+        return Err("collector snapshot is unavailable, partial, or stale".into());
+    }
     Ok(snapshot)
 }
 
@@ -86,7 +115,6 @@ fn get_monitor_settings(app: AppHandle<Wry>) -> Result<MonitorSettings, String> 
 #[tauri::command]
 fn save_monitor_settings(
     app: AppHandle<Wry>,
-    scheduler: State<'_, usage::UsageSchedulerState>,
     settings: MonitorSettings,
 ) -> Result<MonitorSettings, String> {
     let saved = monitor::save_settings(&app, settings)?;
@@ -101,28 +129,38 @@ fn save_monitor_settings(
             .map_err(|error| error.to_string())?;
     }
 
-    scheduler
-        .scheduler
-        .set_policy(saved.usage_refresh_policy.clone());
-
     Ok(saved)
 }
 
 #[tauri::command]
-fn get_usage_scheduler_status(
-    state: State<'_, usage::UsageSchedulerState>,
-) -> usage::UsageSchedulerStatus {
-    state.scheduler.status()
+fn get_usage_scheduler_status(state: State<'_, CollectorIpcState>) -> Value {
+    usage::collector_ipc::request_path(&state.endpoint, "GET_STATUS", Value::Null)
+        .ok()
+        .and_then(|value| value.get("scheduler").cloned())
+        .unwrap_or_else(
+            || json!({"mode": "unavailable", "policy": "adaptive", "watcherActive": false, "refreshError": "Collector unavailable"}),
+        )
 }
 
 #[tauri::command]
-fn get_cached_codex_snapshot(state: State<'_, usage::UsageSchedulerState>) -> Option<Value> {
-    state.scheduler.cached_snapshot()
+fn get_cached_codex_snapshot(
+    app: AppHandle<Wry>,
+    state: State<'_, CollectorIpcState>,
+) -> Option<Value> {
+    let snapshot = current_collector_snapshot(&state.endpoint).ok();
+    if let Some(snapshot) = snapshot.as_ref() {
+        // Notifications/history remain a UI concern; this is not a usage DB
+        // write and the collector remains the sole durable usage writer.
+        monitor::process_snapshot(&app, snapshot);
+    }
+    snapshot
 }
 
 #[tauri::command]
-fn refresh_usage_now(state: State<'_, usage::UsageSchedulerState>) -> Result<u64, String> {
-    state.scheduler.request_refresh()
+fn refresh_usage_now(state: State<'_, CollectorIpcState>) -> Result<u64, String> {
+    usage::collector_ipc::request_path(&state.endpoint, "REFRESH_NOW", Value::Null)?
+        .as_u64()
+        .ok_or_else(|| "collector returned an invalid refresh generation".into())
 }
 
 #[tauri::command]
@@ -169,10 +207,44 @@ fn get_usage_analytics_v1(
 
 #[tauri::command]
 fn get_category_usage(
-    app: AppHandle<Wry>,
+    _app: AppHandle<Wry>,
+    state: State<'_, CollectorIpcState>,
     period: Option<String>,
-) -> Result<usage::CategoryUsage, String> {
-    usage::analytics::app_category_usage(&app, period.as_deref().unwrap_or("day"))
+) -> Result<Value, String> {
+    usage::collector_ipc::request_path(
+        &state.endpoint,
+        "GET_CATEGORY_USAGE",
+        json!({"period": period.as_deref().unwrap_or("day")}),
+    )
+}
+
+#[tauri::command]
+fn get_collector_status(state: State<'_, CollectorIpcState>) -> Result<Value, String> {
+    usage::collector_ipc::request_path(&state.endpoint, "GET_STATUS", Value::Null)
+}
+
+#[tauri::command]
+fn get_collector_data_health(state: State<'_, CollectorIpcState>) -> Result<Value, String> {
+    usage::collector_ipc::request_path(&state.endpoint, "GET_DATA_HEALTH", Value::Null)
+}
+
+#[tauri::command]
+fn get_collector_account(state: State<'_, CollectorIpcState>) -> Result<Value, String> {
+    usage::collector_ipc::request_path(&state.endpoint, "GET_ACCOUNT", Value::Null)
+}
+
+#[tauri::command]
+fn rebuild_collector_account(
+    state: State<'_, CollectorIpcState>,
+    account_key: String,
+) -> Result<bool, String> {
+    usage::collector_ipc::request_path(
+        &state.endpoint,
+        "REBUILD_ACCOUNT",
+        json!({"accountKey": account_key}),
+    )?
+    .as_bool()
+    .ok_or_else(|| "collector returned an invalid rebuild result".into())
 }
 
 pub(crate) fn fetch_codex_snapshot(client: &Arc<CodexRpcClient>) -> Result<Value, String> {
@@ -225,7 +297,10 @@ pub(crate) fn fetch_codex_snapshot(client: &Arc<CodexRpcClient>) -> Result<Value
         Err(error) => (None, Some(error.clone()), classify_account_error(&error)),
     };
 
-    let rate_limits = rate_limits_result?;
+    let (rate_limits, rate_limits_error) = match rate_limits_result {
+        Ok(value) => (Some(value), None),
+        Err(error) => (None, Some(error)),
+    };
 
     let (usage, usage_error) = match usage_result {
         Ok(value) => (Some(value), None),
@@ -255,8 +330,14 @@ pub(crate) fn fetch_codex_snapshot(client: &Arc<CodexRpcClient>) -> Result<Value
         "accountState":
             account_state,
 
+        "codexGeneration":
+            client.status().generation,
+
         "rateLimits":
             rate_limits,
+
+        "rateLimitsError":
+            rate_limits_error,
 
         "usage":
             usage,
@@ -448,19 +529,16 @@ fn format_tray_reset_absolute(resets_at: Option<i64>) -> String {
 }
 
 fn apply_tray_snapshot(snapshot: &Value, display: &TrayDisplay) {
+    if !snapshot_is_complete_signed_in(snapshot) {
+        clear_tray_usage(display, "Codex 账号不可用", "账号状态不可用");
+        return;
+    }
     let summary = tray_quota_summary(&snapshot);
     let used = summary.used_percent.round();
     let remaining = summary.remaining_percent.round();
     let reset_relative = format_tray_reset_relative(summary.resets_at);
     let reset_absolute = format_tray_reset_absolute(summary.resets_at);
-    let account_available =
-        snapshot.get("accountState").and_then(Value::as_str) == Some("signedIn");
-
-    let _ = display.status.set_text(if account_available {
-        "Codex 已连接"
-    } else {
-        "Codex 已连接 · 账号不可用"
-    });
+    let _ = display.status.set_text("Codex 已连接");
     let _ = display.weekly_title.set_text(&summary.label);
     let _ = display
         .weekly_progress
@@ -471,24 +549,97 @@ fn apply_tray_snapshot(snapshot: &Value, display: &TrayDisplay) {
         format_tray_tokens(summary.today_tokens),
     ));
 
-    let tooltip = if account_available {
-        format!(
-            "Codex 用量\n{} {}%\n剩余 {}%\n{}",
-            summary.label, used, remaining, reset_relative,
-        )
-    } else {
-        "Codex 用量\n账号不可用\n请登录 Codex".into()
-    };
+    let tooltip = format!(
+        "Codex 用量\n{} {}%\n剩余 {}%\n{}",
+        summary.label, used, remaining, reset_relative,
+    );
 
     let _ = display.tray.set_tooltip(Some(tooltip));
-    let _ = display.tray.set_title(Some(format!(
-        "Codex {}",
-        if account_available {
-            format!("{:.0}%", used)
-        } else {
-            "—".into()
-        },
-    )));
+    let _ = display.tray.set_title(Some(format!("Codex {:.0}%", used)));
+}
+
+pub(crate) fn snapshot_is_complete_signed_in(snapshot: &Value) -> bool {
+    snapshot.get("accountState").and_then(Value::as_str) == Some("signedIn")
+        && snapshot
+            .get("account")
+            .and_then(|account| account.get("account"))
+            .is_some_and(|account| !account.is_null())
+        && recorder::explicit_snapshot_account_key(snapshot).is_some()
+        && snapshot
+            .get("accountError")
+            .and_then(Value::as_str)
+            .is_none()
+        && snapshot
+            .get("rateLimits")
+            .is_some_and(rate_limits_shape_complete)
+        && snapshot
+            .get("rateLimitsError")
+            .and_then(Value::as_str)
+            .is_none()
+        && snapshot.get("usage").is_some_and(usage_shape_complete)
+        && snapshot.get("usageError").and_then(Value::as_str).is_none()
+}
+
+fn rate_limits_shape_complete(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object
+            .get("rateLimitsByLimitId")
+            .is_some_and(Value::is_object)
+            || object.get("rateLimits").is_some_and(Value::is_object)
+    })
+}
+
+fn usage_shape_complete(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("dailyUsageBuckets") && object.contains_key("summary")
+    })
+}
+
+fn snapshot_matches_collector_status(snapshot: &Value, status: &Value) -> bool {
+    if !snapshot_is_complete_signed_in(snapshot) {
+        return false;
+    }
+    let collector_running = status
+        .get("collector")
+        .and_then(|collector| collector.get("status"))
+        .and_then(Value::as_str)
+        == Some("running");
+    let scheduler = status.get("scheduler");
+    let refresh_generation = scheduler
+        .and_then(|value| value.get("refreshGeneration"))
+        .and_then(Value::as_u64);
+    let snapshot_generation = snapshot.get("refreshGeneration").and_then(Value::as_u64);
+    let refresh_idle = scheduler
+        .and_then(|value| value.get("refreshing"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    let codex = status.get("codex");
+    let codex_ready = codex
+        .and_then(|value| value.get("phase"))
+        .and_then(Value::as_str)
+        == Some("ready");
+    let codex_generation = codex
+        .and_then(|value| value.get("generation"))
+        .and_then(Value::as_u64);
+    let snapshot_codex_generation = snapshot.get("codexGeneration").and_then(Value::as_u64);
+    collector_running
+        && refresh_idle
+        && refresh_generation.is_some()
+        && snapshot_generation == refresh_generation
+        && codex_ready
+        && snapshot_codex_generation == codex_generation
+}
+
+fn clear_tray_usage(display: &TrayDisplay, status: &str, message: &str) {
+    let _ = display.status.set_text(status);
+    let _ = display.weekly_title.set_text("额度不可用");
+    let _ = display.weekly_progress.set_text(message);
+    let _ = display.weekly_reset.set_text("等待新鲜账号数据");
+    let _ = display.today.set_text("今日 · —");
+    let _ = display
+        .tray
+        .set_tooltip(Some(format!("Codex 用量\n{}", message)));
+    let _ = display.tray.set_title(Some("Codex"));
 }
 
 fn update_tray_connection_state(display: &TrayDisplay, phase: &str) {
@@ -499,28 +650,47 @@ fn update_tray_connection_state(display: &TrayDisplay, phase: &str) {
         _ => return,
     };
 
-    let _ = display.status.set_text(status);
-    let _ = display.weekly_progress.set_text(message);
-    let _ = display
-        .tray
-        .set_tooltip(Some(format!("Codex 用量\n{}", message,)));
-    let _ = display.tray.set_title(Some("Codex"));
+    clear_tray_usage(display, status, message);
+}
+
+fn update_tray_collector_unavailable(display: &TrayDisplay) {
+    clear_tray_usage(display, "Collector 不可用", "采集器已停止或无法连接");
+}
+
+fn collector_status_is_running(status: &Value) -> bool {
+    status
+        .get("collector")
+        .and_then(|collector| collector.get("status"))
+        .and_then(Value::as_str)
+        == Some("running")
 }
 
 fn start_tray_updater(app: &tauri::App<Wry>, display: Arc<TrayDisplay>) {
-    let event_display = Arc::clone(&display);
-    app.listen_any("codex://usage-snapshot", move |event| {
-        if let Ok(snapshot) = serde_json::from_str::<Value>(event.payload()) {
-            apply_tray_snapshot(&snapshot, &event_display);
-        }
-    });
-
-    if let Some(snapshot) = app
-        .state::<usage::UsageSchedulerState>()
-        .scheduler
-        .cached_snapshot()
-    {
-        apply_tray_snapshot(&snapshot, &display);
+    let collector_endpoint = usage::collector_ipc::endpoint_path(&app.handle()).ok();
+    if let Some(event_endpoint) = collector_endpoint.clone() {
+        let event_display = Arc::clone(&display);
+        app.listen_any("codex://usage-snapshot", move |event| {
+            if let Ok(snapshot) = serde_json::from_str::<Value>(event.payload()) {
+                match usage::collector_ipc::request_path(&event_endpoint, "GET_STATUS", Value::Null)
+                {
+                    Ok(status) if snapshot_matches_collector_status(&snapshot, &status) => {
+                        match usage::collector_ipc::request_path(
+                            &event_endpoint,
+                            "GET_STATUS",
+                            Value::Null,
+                        ) {
+                            Ok(final_status)
+                                if snapshot_matches_collector_status(&snapshot, &final_status) =>
+                            {
+                                apply_tray_snapshot(&snapshot, &event_display);
+                            }
+                            _ => update_tray_collector_unavailable(&event_display),
+                        }
+                    }
+                    _ => update_tray_collector_unavailable(&event_display),
+                }
+            }
+        });
     }
 
     let event_display = Arc::clone(&display);
@@ -536,6 +706,147 @@ fn start_tray_updater(app: &tauri::App<Wry>, display: Arc<TrayDisplay>) {
             }
         }
     });
+
+    // The standalone collector has no Tauri event emitter. Poll its snapshot
+    // and Codex status so the tray cannot silently remain on the old
+    // `codex://usage-snapshot` compatibility listener.
+    if let Some(endpoint) = collector_endpoint {
+        let poll_display = Arc::clone(&display);
+        let _ = std::thread::Builder::new()
+            .name("nexus-tray-collector-poll".into())
+            .spawn(move || loop {
+                let health =
+                    usage::collector_ipc::request_path(&endpoint, "GET_STATUS", Value::Null);
+                if !health.as_ref().is_ok_and(collector_status_is_running) {
+                    update_tray_collector_unavailable(&poll_display);
+                } else {
+                    match usage::collector_ipc::request_path(
+                        &endpoint,
+                        "GET_CODEX_STATUS",
+                        Value::Null,
+                    ) {
+                        Ok(codex_status) => {
+                            let phase = codex_status.get("phase").and_then(Value::as_str);
+                            if phase != Some("ready") {
+                                update_tray_connection_state(
+                                    &poll_display,
+                                    phase.unwrap_or("disconnected"),
+                                );
+                            } else {
+                                match current_collector_snapshot(&endpoint) {
+                                    Ok(snapshot) => {
+                                        apply_tray_snapshot(&snapshot, &poll_display);
+                                    }
+                                    _ => update_tray_collector_unavailable(&poll_display),
+                                }
+                            }
+                        }
+                        Err(_) => update_tray_collector_unavailable(&poll_display),
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            });
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use super::{
+        collector_status_is_running, snapshot_is_complete_signed_in,
+        snapshot_matches_collector_status,
+    };
+    use serde_json::{json, Value};
+
+    #[test]
+    fn collector_exit_is_not_treated_as_healthy_for_tray_polling() {
+        assert!(collector_status_is_running(&json!({
+            "collector": {"status": "running"}
+        })));
+        assert!(!collector_status_is_running(&json!({
+            "collector": {"status": "unavailable"}
+        })));
+        assert!(!collector_status_is_running(&json!({})));
+    }
+
+    #[test]
+    fn signed_out_or_account_error_snapshots_cannot_supply_tray_quota() {
+        assert!(snapshot_is_complete_signed_in(&json!({
+            "accountState": "signedIn",
+            "account": {"account": {"id": "a"}},
+            "rateLimits": {"rateLimitsByLimitId": {}},
+            "usage": {"dailyUsageBuckets": [], "summary": null}
+        })));
+        assert!(!snapshot_is_complete_signed_in(&json!({
+            "accountState": "signedOut",
+            "account": null,
+            "rateLimits": {"rateLimitsByLimitId": {"codex": {"primary": {"usedPercent": 99}}}}
+        })));
+        assert!(!snapshot_is_complete_signed_in(&json!({
+            "accountState": "signedIn",
+            "account": {"account": {"id": "old"}},
+            "accountError": "account/read unavailable"
+        })));
+        assert!(!snapshot_is_complete_signed_in(&json!({
+            "accountState": "signedIn",
+            "account": {"account": {}},
+            "rateLimits": {"rateLimitsByLimitId": {}},
+            "usage": {"dailyUsageBuckets": [], "summary": null}
+        })));
+    }
+
+    #[test]
+    fn rate_limits_or_usage_errors_fail_closed_independently() {
+        let base = json!({
+            "accountState": "signedIn",
+            "account": {"account": {"id": "a"}},
+            "rateLimits": {"rateLimitsByLimitId": {}},
+            "usage": {"dailyUsageBuckets": [], "summary": null}
+        });
+        let mut rate_limits_error = base.clone();
+        rate_limits_error["rateLimits"] = Value::Null;
+        rate_limits_error["rateLimitsError"] = json!("rate limit RPC failed");
+        assert!(!snapshot_is_complete_signed_in(&rate_limits_error));
+
+        let mut usage_error = base;
+        usage_error["usage"] = Value::Null;
+        usage_error["usageError"] = json!("usage RPC failed");
+        assert!(!snapshot_is_complete_signed_in(&usage_error));
+    }
+
+    #[test]
+    fn stale_refresh_or_codex_generation_cannot_supply_tray_snapshot() {
+        let snapshot = json!({
+            "accountState": "signedIn",
+            "account": {"account": {"id": "a"}},
+            "rateLimits": {"rateLimitsByLimitId": {}},
+            "usage": {"dailyUsageBuckets": [], "summary": null},
+            "refreshGeneration": 2,
+            "codexGeneration": 7
+        });
+        let status = json!({
+            "collector": {"status": "running"},
+            "scheduler": {"refreshing": false, "refreshGeneration": 1},
+            "codex": {"phase": "ready", "generation": 7}
+        });
+        assert!(!snapshot_matches_collector_status(&snapshot, &status));
+
+        let current = json!({
+            "collector": {"status": "running"},
+            "scheduler": {"refreshing": false, "refreshGeneration": 2},
+            "codex": {"phase": "ready", "generation": 7}
+        });
+        assert!(snapshot_matches_collector_status(&snapshot, &current));
+
+        let after_reconnect = json!({
+            "collector": {"status": "running"},
+            "scheduler": {"refreshing": false, "refreshGeneration": 2},
+            "codex": {"phase": "ready", "generation": 8}
+        });
+        assert!(!snapshot_matches_collector_status(
+            &snapshot,
+            &after_reconnect
+        ));
+    }
 }
 
 fn classify_account_error(error: &str) -> &'static str {
@@ -554,6 +865,19 @@ fn classify_account_error(error: &str) -> &'static str {
         "signedOut"
     } else {
         "error"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collector_unavailable_status;
+
+    #[test]
+    fn collector_unavailable_does_not_claim_codex_transport_state() {
+        let status = collector_unavailable_status("IPC timeout");
+        assert_eq!(status.phase, "disconnected");
+        assert!(status.collector_unavailable);
+        assert_eq!(status.last_error.as_deref(), Some("IPC timeout"));
     }
 }
 
@@ -581,12 +905,6 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let client = CodexRpcClient::start(app.handle().clone());
-
-            app.manage(CodexState {
-                client: Arc::clone(&client),
-            });
-
             if let Ok(settings) = monitor::load_settings(app.handle()) {
                 if settings.launch_at_startup {
                     if let Err(error) = app.autolaunch().enable() {
@@ -601,10 +919,12 @@ pub fn run() {
                 }
             }
 
-            let usage_scheduler =
-                usage::UsageRefreshScheduler::start(app.handle().clone(), Arc::clone(&client));
-            app.manage(usage::UsageSchedulerState {
-                scheduler: usage_scheduler,
+            // The Collector is an OS-managed process. Tauri only discovers
+            // its endpoint and stays a read-only proxy client; it never
+            // starts a scheduler/watcher or acquires the usage writer lock.
+            let collector_endpoint = usage::collector_ipc::endpoint_path(app.handle())?;
+            app.manage(CollectorIpcState {
+                endpoint: collector_endpoint,
             });
 
             let status = MenuItem::with_id(app, "status", "Codex 正在连接…", false, None::<&str>)?;
@@ -716,7 +1036,11 @@ pub fn run() {
             get_usage_history,
             get_usage_analytics,
             get_usage_analytics_v1,
-            get_category_usage
+            get_category_usage,
+            get_collector_status,
+            get_collector_data_health,
+            get_collector_account,
+            rebuild_collector_account
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

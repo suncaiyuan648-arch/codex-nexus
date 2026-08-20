@@ -166,6 +166,10 @@ struct QuotaStep {
     start_at: i64,
     end_at: i64,
     observed_delta_percent: f64,
+    unattributed_percent: f64,
+    observation_gap_ms: i64,
+    gap_token_count: i64,
+    sample_quality: String,
 }
 
 #[derive(Clone, Debug)]
@@ -188,12 +192,32 @@ struct CategoryEstimateAccumulator {
     observed_quota_percent: f64,
     pre_observation_tokens: i64,
     pending_tokens: i64,
+    observation_gap_ms: i64,
+    gap_token_count: i64,
+    unattributed_quota_percent: f64,
+    sample_quality: String,
     rejected_sample_count: i64,
     boundary_overlap_count: i64,
     rates: Vec<(f64, f64)>,
     hard_blockers: Vec<String>,
     warnings: Vec<String>,
     rejection_reasons: Vec<String>,
+}
+
+fn merge_sample_quality(current: &str, next: &str) -> String {
+    let rank = |value: &str| match value {
+        "unresolved" => 3,
+        "long_gap" => 2,
+        "bounded_gap" => 1,
+        _ => 0,
+    };
+    if rank(next) > rank(current) {
+        next.into()
+    } else if current.is_empty() {
+        next.into()
+    } else {
+        current.into()
+    }
 }
 
 fn add_rejection_reason(value: &mut CategoryEstimateAccumulator, reason: &str) {
@@ -208,6 +232,7 @@ fn add_rejection_reason(value: &mut CategoryEstimateAccumulator, reason: &str) {
         | "pre_observation_tokens"
         | "source_gap"
         | "mixed_category_unresolved" => &mut value.warnings,
+        "short_observation_gap" | "unattributed_quota_delta" => &mut value.warnings,
         _ => &mut value.hard_blockers,
     };
     if !destination.iter().any(|item| item == reason) {
@@ -237,7 +262,9 @@ fn quota_steps(
     };
     let mut statement = connection
         .prepare(
-            "SELECT start_at, end_at, observed_delta_percent
+            "SELECT start_at, end_at, observed_delta_percent,
+                    COALESCE(unattributed_percent, 0), observation_gap_ms,
+                    gap_token_count, sample_quality
              FROM quota_intervals
              WHERE account_key = ?1 AND limit_id = ?2 AND window = ?3
                AND window_duration_mins = 10080
@@ -251,6 +278,10 @@ fn quota_steps(
                 start_at: row.get(0)?,
                 end_at: row.get(1)?,
                 observed_delta_percent: row.get(2)?,
+                unattributed_percent: row.get(3)?,
+                observation_gap_ms: row.get(4)?,
+                gap_token_count: row.get(5)?,
+                sample_quality: row.get(6)?,
             })
         })
         .map_err(|error| error.to_string())?;
@@ -469,6 +500,32 @@ fn estimate_weekly_categories(
             }
             continue;
         }
+        for value in accumulators.values_mut() {
+            value.observation_gap_ms = value
+                .observation_gap_ms
+                .saturating_add(step.observation_gap_ms);
+            value.sample_quality =
+                merge_sample_quality(&value.sample_quality, &step.sample_quality);
+            value.unattributed_quota_percent += step.unattributed_percent;
+        }
+        if step.unattributed_percent > 0.0 {
+            for value in accumulators.values_mut() {
+                add_rejection_reason(value, "unattributed_quota_delta");
+            }
+        }
+        if step.sample_quality == "long_gap" {
+            for value in accumulators.values_mut() {
+                add_rejection_reason(value, "long_observation_gap");
+            }
+        } else if step.sample_quality == "unresolved" {
+            for value in accumulators.values_mut() {
+                add_rejection_reason(value, "unresolved_source");
+            }
+        } else if step.sample_quality == "bounded_gap" {
+            for value in accumulators.values_mut() {
+                add_rejection_reason(value, "short_observation_gap");
+            }
+        }
         for key in &categories_in_step {
             if let Some(accumulator) = accumulators.get_mut(key) {
                 accumulator.observed_sample_count += 1;
@@ -518,6 +575,9 @@ fn estimate_weekly_categories(
         let Some(accumulator) = accumulators.get_mut(&key) else {
             continue;
         };
+        accumulator.gap_token_count = accumulator
+            .gap_token_count
+            .saturating_add(step.gap_token_count);
         if tokens <= 0 {
             accumulator.rejected_sample_count += 1;
             if !boundary_categories.contains(&key) {
@@ -656,6 +716,10 @@ fn estimate_weekly_categories(
                     observed_tokens: value.observed_tokens,
                     observed_quota_percent: value.observed_quota_percent,
                     cumulative_observed_quota_delta: value.observed_quota_percent,
+                    unattributed_quota_percent: value.unattributed_quota_percent,
+                    observation_gap_ms: value.observation_gap_ms,
+                    gap_token_count: value.gap_token_count,
+                    sample_quality: value.sample_quality.clone(),
                     coverage_ratio,
                     pre_observation_tokens: value.pre_observation_tokens,
                     eligible_tokens,
@@ -675,7 +739,12 @@ fn estimate_weekly_categories(
                     rejection_reasons,
                     external_usage_risk: value.pre_observation_tokens > 0
                         || value.pending_tokens > 0,
-                    confidence: if coverage_ratio >= 0.85 && dispersion <= 0.35 {
+                    confidence: if value.sample_quality == "bounded_gap" {
+                        // A bounded gap can still produce an estimate, but
+                        // never with the same confidence as a continuous
+                        // observation stream.
+                        Confidence::Low
+                    } else if coverage_ratio >= 0.85 && dispersion <= 0.35 {
                         Confidence::High
                     } else {
                         Confidence::Medium
@@ -719,6 +788,10 @@ fn insufficient_estimate(
         observed_tokens: value.observed_tokens,
         observed_quota_percent: value.observed_quota_percent,
         cumulative_observed_quota_delta: value.observed_quota_percent,
+        unattributed_quota_percent: value.unattributed_quota_percent,
+        observation_gap_ms: value.observation_gap_ms,
+        gap_token_count: value.gap_token_count,
+        sample_quality: value.sample_quality,
         coverage_ratio,
         pre_observation_tokens: value.pre_observation_tokens,
         eligible_tokens,
@@ -1118,6 +1191,15 @@ mod tests {
             let connection = Connection::open(&path).unwrap();
             initialize_schema(&connection).unwrap();
             recorder::ensure_account(&connection, "account:query", 10).unwrap();
+            crate::usage::collector_core::record_account_presence(
+                &connection,
+                "account:query",
+                10,
+                "account_read",
+                "high",
+                None,
+            )
+            .unwrap();
             connection
                 .execute(
                     "INSERT INTO account_usage_data_versions
@@ -1236,6 +1318,61 @@ mod tests {
                 [rollout::ROLLOUT_PARSER_VERSION],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn bounded_gap_is_a_warning_and_lowers_confidence_not_a_hard_block() {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection).unwrap();
+        seed_weekly_steps(&connection);
+        connection
+            .execute(
+                "INSERT INTO collector_gaps
+                 (session_id, start_at, end_at, duration_ms, reason, created_at)
+                 VALUES ('s', 2000, 2100, 100000, 'app_restart', 2100)",
+                [],
+            )
+            .unwrap();
+        for (index, sampled_at) in [2500, 3500, 4500, 5500, 6500].into_iter().enumerate() {
+            insert_timeline_sample(
+                &connection,
+                &format!("bounded-{index}"),
+                "gpt-5.6-sol",
+                sampled_at,
+                1_000,
+                1_000,
+            );
+        }
+        quota::refresh_intervals(&connection, "a", "weekly", "primary").unwrap();
+        let categories = single_category_tokens(&connection, "gpt-5.6-sol", 5_000);
+        let estimate = estimate_weekly_categories(
+            &connection,
+            Some("a"),
+            1000,
+            10000,
+            Some(&CategoryUsageQuotaWindow {
+                limit_id: "weekly".into(),
+                window: "primary".into(),
+                used_percent: 16.0,
+                remaining_percent: 84.0,
+                window_duration_mins: 10080,
+                resets_at: Some(20000),
+            }),
+            &categories,
+        )
+        .unwrap()
+        .remove(&("gpt-5.6-sol".into(), "xhigh".into(), "standard".into()))
+        .unwrap();
+        assert_eq!(estimate.status, USAGE_STATUS_ESTIMATED);
+        assert_eq!(estimate.confidence, Confidence::Low);
+        assert!(estimate
+            .warnings
+            .iter()
+            .any(|reason| reason == "short_observation_gap"));
+        assert!(!estimate
+            .hard_blockers
+            .iter()
+            .any(|reason| reason == "short_observation_gap"));
     }
 
     #[test]

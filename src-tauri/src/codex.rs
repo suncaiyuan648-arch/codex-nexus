@@ -20,6 +20,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 type RpcResult = Result<Value, String>;
 type PendingMap = HashMap<i64, mpsc::Sender<RpcResult>>;
+type AccountUpdatedHandler = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Debug)]
 struct CodexCommand {
@@ -28,7 +29,7 @@ struct CodexCommand {
     display_path: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionStatus {
     pub phase: String,
@@ -37,6 +38,7 @@ pub struct ConnectionStatus {
     pub retry_in_ms: Option<u64>,
     pub last_error: Option<String>,
     pub codex_path: Option<String>,
+    pub collector_unavailable: bool,
 }
 
 impl Default for ConnectionStatus {
@@ -48,12 +50,14 @@ impl Default for ConnectionStatus {
             retry_in_ms: None,
             last_error: None,
             codex_path: None,
+            collector_unavailable: false,
         }
     }
 }
 
 pub struct CodexRpcClient {
-    app: AppHandle,
+    app: Option<AppHandle>,
+    account_updated_handler: Option<AccountUpdatedHandler>,
 
     writer: Mutex<Option<mpsc::Sender<Value>>>,
     child: Mutex<Option<Child>>,
@@ -74,8 +78,27 @@ pub struct CodexRpcClient {
 
 impl CodexRpcClient {
     pub fn start(app: AppHandle) -> Arc<Self> {
+        Self::start_with_app(Some(app), None)
+    }
+
+    /// Start the reconnecting app-server client without a Tauri AppHandle and
+    /// with a Tauri-free account invalidation hook. The standalone collector
+    /// uses this path so both RPC ownership and identity fencing survive UI
+    /// process exits.
+    pub fn start_headless_with_account_updates<F>(handler: F) -> Arc<Self>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        Self::start_with_app(None, Some(Arc::new(handler)))
+    }
+
+    fn start_with_app(
+        app: Option<AppHandle>,
+        account_updated_handler: Option<AccountUpdatedHandler>,
+    ) -> Arc<Self> {
         let client = Arc::new(Self {
             app,
+            account_updated_handler,
             writer: Mutex::new(None),
             child: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
@@ -420,12 +443,15 @@ impl CodexRpcClient {
             if let Some(params) = message.get("params") {
                 println!("[Codex RPC] rate limits updated");
 
-                if let Err(error) = crate::usage::record_rate_limit_update(&self.app, params) {
-                    eprintln!("[Usage] failed to record rate-limit update: {error}");
-                }
-
-                if let Err(error) = self.app.emit("codex://rate-limits-updated", params.clone()) {
-                    eprintln!("[Tauri] failed to emit rate-limit update: {error}");
+                if let Some(app) = self.app.as_ref() {
+                    if let Err(error) = app.emit("codex://rate-limits-updated", params.clone()) {
+                        eprintln!("[Tauri] failed to emit rate-limit update: {error}");
+                    }
+                    crate::usage::collector_ipc::emit_event(
+                        app,
+                        crate::usage::collector_ipc::EVENT_RATE_LIMIT_UPDATED,
+                        params.clone(),
+                    );
                 }
             }
         }
@@ -433,11 +459,22 @@ impl CodexRpcClient {
         if method == "account/updated" {
             println!("[Codex RPC] account updated");
 
-            if let Err(error) = self.app.emit(
-                "codex://account-updated",
-                message.get("params").cloned().unwrap_or(Value::Null),
-            ) {
-                eprintln!("[Tauri] failed to emit account update: {error}");
+            if let Some(handler) = self.account_updated_handler.as_ref() {
+                handler();
+            }
+
+            if let Some(app) = self.app.as_ref() {
+                if let Err(error) = app.emit(
+                    "codex://account-updated",
+                    message.get("params").cloned().unwrap_or(Value::Null),
+                ) {
+                    eprintln!("[Tauri] failed to emit account update: {error}");
+                }
+                crate::usage::collector_ipc::emit_event(
+                    app,
+                    crate::usage::collector_ipc::EVENT_ACCOUNT_UPDATED,
+                    message.get("params").cloned().unwrap_or(Value::Null),
+                );
             }
         }
     }
@@ -685,13 +722,16 @@ impl CodexRpcClient {
             retry_in_ms,
             last_error,
             codex_path,
+            collector_unavailable: false,
         };
 
         if let Ok(mut current) = self.status.lock() {
             *current = status.clone();
         }
 
-        let _ = self.app.emit("codex://connection-state", status);
+        if let Some(app) = self.app.as_ref() {
+            let _ = app.emit("codex://connection-state", status);
+        }
     }
 
     fn fail_all_pending(&self, error: String) {
