@@ -631,14 +631,17 @@ function CollectorHealthPanel({
     : undefined;
   const collectorBusy = collector?.status !== "running" || schedulerStatus?.refreshing === true;
   const accountHealthSummary = useMemo(() => {
-    if (!health || health.accounts.length <= 1) return null;
-    const unresolvedAccounts = health.accounts.filter((account) => account.accountKey.startsWith("unresolved:"));
+    if (!health) return null;
+    const unresolvedSourceCount = health.unresolvedSourceCount > 0
+      ? health.unresolvedSourceCount
+      : health.accounts.filter((account) => account.accountKey.startsWith("unresolved:")).length;
+    if (health.accounts.length <= 1 && unresolvedSourceCount === 0) return null;
     const namedAccounts = health.accounts
       .filter((account) => !account.accountKey.startsWith("unresolved:"))
       .slice(0, 4)
       .map((account) => `${account.accountKey.slice(0, 28)}…=${account.status}`);
-    if (unresolvedAccounts.length > 0) {
-      namedAccounts.push(`${unresolvedAccounts.length} 个 unresolved source`);
+    if (unresolvedSourceCount > 0) {
+      namedAccounts.push(`${unresolvedSourceCount} 个 unresolved source`);
     }
     return namedAccounts.join(" · ");
   }, [health]);

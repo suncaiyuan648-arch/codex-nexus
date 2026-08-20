@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::{
     io::{Read, Write},
     path::PathBuf,
+    thread,
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +29,7 @@ pub const EVENT_REBUILD_PROGRESS: &str = "collector://rebuild-progress";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTIONS: usize = 32;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const EMPTY_FRAME_RETRIES: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -330,12 +332,18 @@ pub fn data_health_for_connection(
     endpoint: &str,
 ) -> Result<CollectorDataHealth, String> {
     let collector = status_from_connection(Some(connection), endpoint);
+    // Health is a UI diagnostic, not a source export. Keep the IPC payload
+    // bounded even when historical source paths and unresolved account keys
+    // are numerous; the exact unresolved total is returned separately below.
     let sources = connection
         .prepare(
             "SELECT source_id, canonical_path, account_key, binding_status,
                     binding_source, health_status, last_offset, last_size,
                     last_activity_at, last_error
-             FROM rollout_sources ORDER BY updated_at DESC",
+             FROM rollout_sources
+             ORDER BY CASE WHEN last_error IS NOT NULL THEN 0 ELSE 1 END,
+                      updated_at DESC
+             LIMIT 24",
         )
         .map_err(|error| error.to_string())?
         .query_map([], |row| {
@@ -411,7 +419,10 @@ pub fn data_health_for_connection(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     let mut account_rows = connection
-        .prepare("SELECT account_key FROM account_usage_data_versions ORDER BY account_key")
+        .prepare(
+            "SELECT account_key FROM account_usage_data_versions
+             WHERE account_key NOT LIKE 'unresolved:%' ORDER BY account_key",
+        )
         .map_err(|error| error.to_string())?;
     let accounts = account_rows
         .query_map([], |row| row.get::<_, String>(0))
@@ -421,10 +432,13 @@ pub fn data_health_for_connection(
         .map(|account| rollout::account_data_health(&connection, &account))
         .filter_map(|row| row.transpose())
         .collect::<Result<Vec<_>, _>>()?;
-    let unresolved_source_count = sources
-        .iter()
-        .filter(|source| source.binding_status == "unresolved")
-        .count() as i64;
+    let unresolved_source_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM rollout_sources WHERE binding_status = 'unresolved'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
     Ok(CollectorDataHealth {
         collector,
         sources,
@@ -437,6 +451,38 @@ pub fn data_health_for_connection(
 }
 
 pub fn request_path(endpoint: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
+    let mut last_error = None;
+    for attempt in 0..EMPTY_FRAME_RETRIES {
+        match request_path_once(endpoint, method, params.clone()) {
+            Ok(value) => return Ok(value),
+            Err(error) if error.contains("IPC request is empty") => {
+                last_error = Some(error);
+                if attempt + 1 < EMPTY_FRAME_RETRIES {
+                    thread::sleep(Duration::from_millis(15));
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "[Collector IPC] request failed method={} endpoint={} error={}",
+                    method,
+                    endpoint.display(),
+                    error
+                );
+                return Err(error);
+            }
+        }
+    }
+    let error = last_error.unwrap_or_else(|| "collector IPC request failed".into());
+    eprintln!(
+        "[Collector IPC] empty-frame retries exhausted method={} endpoint={} error={}",
+        method,
+        endpoint.display(),
+        error
+    );
+    Err(error)
+}
+
+fn request_path_once(endpoint: &PathBuf, method: &str, params: Value) -> Result<Value, String> {
     let request = IpcRequest {
         id: format!("ui-{}", now_ms()),
         method: method.into(),
