@@ -162,8 +162,8 @@ pub fn endpoint_path(app: &AppHandle<Wry>) -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-pub fn validate_endpoint(endpoint: &std::path::Path) -> Result<(), String> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+fn validate_endpoint_identity(endpoint: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let metadata = std::fs::symlink_metadata(endpoint)
         .map_err(|error| format!("collector endpoint metadata: {error}"))?;
     if !metadata.file_type().is_socket() {
@@ -172,6 +172,15 @@ pub fn validate_endpoint(endpoint: &std::path::Path) -> Result<(), String> {
     if metadata.uid() != unsafe { libc::geteuid() } {
         return Err("collector endpoint owner does not match current user".into());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn validate_endpoint(endpoint: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    validate_endpoint_identity(endpoint)?;
+    let metadata = std::fs::symlink_metadata(endpoint)
+        .map_err(|error| format!("collector endpoint metadata: {error}"))?;
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err("collector endpoint permissions must be 0600".into());
     }
@@ -194,8 +203,15 @@ pub fn bind_secure_listener(
         Ok(listener) => listener,
         Err(error) if endpoint.exists() => {
             // Never unlink an endpoint owned by another user or one that is
-            // not already a locked-down socket. This prevents a typo or a
-            // compromised path from turning stale cleanup into file deletion.
+            // not a Unix socket. A same-user socket from an older build may
+            // have inherited permissive mode bits; tighten it before checking
+            // whether it is active so a stale upgrade cannot brick startup.
+            validate_endpoint_identity(endpoint)?;
+            fs::set_permissions(endpoint, fs::Permissions::from_mode(0o600)).map_err(
+                |permission_error| {
+                    format!("stale collector endpoint permission repair failed: {permission_error}")
+                },
+            )?;
             validate_endpoint(endpoint)?;
             if UnixStream::connect(endpoint).is_ok() {
                 return Err(format!(
@@ -522,6 +538,33 @@ mod tests {
         fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(validate_endpoint(&endpoint).is_err());
         drop(listener);
+        let _ = fs::remove_file(endpoint);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_same_user_endpoint_with_legacy_mode_is_repaired_and_rebound() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let endpoint = std::env::temp_dir().join(format!(
+            "codex-nexus-stale-endpoint-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let listener = bind_secure_listener(&endpoint).unwrap();
+        drop(listener);
+        fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let rebound = bind_secure_listener(&endpoint).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&endpoint)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(rebound);
         let _ = fs::remove_file(endpoint);
     }
 }
