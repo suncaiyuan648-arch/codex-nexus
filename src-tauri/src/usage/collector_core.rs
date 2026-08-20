@@ -833,6 +833,47 @@ pub fn registered_source_paths(connection: &Connection) -> Result<Vec<PathBuf>, 
         .collect()
 }
 
+/// Cheap preflight used by the standalone service before it asks Codex for
+/// account identity. Most registered rollout files are historical and do not
+/// change between refreshes; re-reading account/read for every one of them
+/// turns a five-second refresh into an unbounded RPC loop. A source still goes
+/// through the full fingerprint/replacement checks when its metadata changes,
+/// and direct catch-up callers retain the conservative deep check.
+pub fn source_needs_refresh(connection: &Connection, path: &Path) -> Result<bool, String> {
+    let canonical_path = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let raw_path = path.to_string_lossy().into_owned();
+    let previous: Option<(String, i64, Option<i64>)> = connection
+        .query_row(
+            "SELECT file_identity, last_size, last_mtime
+             FROM rollout_sources
+             WHERE canonical_path = ?1 OR canonical_path = ?2
+             ORDER BY updated_at DESC LIMIT 1",
+            params![canonical_path, raw_path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let current_size = metadata.len() as i64;
+    let current_identity = file_identity(path)?;
+    let current_mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs() as i64);
+
+    Ok(previous.is_none_or(|(identity, last_size, last_mtime)| {
+        identity != current_identity
+            || last_size != current_size
+            || last_mtime.is_none()
+            || last_mtime != current_mtime
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn bind_source(
     connection: &Connection,

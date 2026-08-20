@@ -535,7 +535,13 @@ function HomeUsageBreakdown({
   );
 }
 
-function CollectorHealthPanel({ reloadToken }: { reloadToken: number }) {
+function CollectorHealthPanel({
+  reloadToken,
+  schedulerStatus,
+}: {
+  reloadToken: number;
+  schedulerStatus: UsageSchedulerStatus | null;
+}) {
   const [health, setHealth] = useState<CollectorDataHealth | null>(null);
   const [loading, setLoading] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
@@ -623,6 +629,19 @@ function CollectorHealthPanel({ reloadToken }: { reloadToken: number }) {
   const accountHealth = currentAccountKey
     ? health?.accounts.find((account) => account.accountKey === currentAccountKey)
     : undefined;
+  const collectorBusy = collector?.status !== "running" || schedulerStatus?.refreshing === true;
+  const accountHealthSummary = useMemo(() => {
+    if (!health || health.accounts.length <= 1) return null;
+    const unresolvedAccounts = health.accounts.filter((account) => account.accountKey.startsWith("unresolved:"));
+    const namedAccounts = health.accounts
+      .filter((account) => !account.accountKey.startsWith("unresolved:"))
+      .slice(0, 4)
+      .map((account) => `${account.accountKey.slice(0, 28)}…=${account.status}`);
+    if (unresolvedAccounts.length > 0) {
+      namedAccounts.push(`${unresolvedAccounts.length} 个 unresolved source`);
+    }
+    return namedAccounts.join(" · ");
+  }, [health]);
   const rebuild = async () => {
     if (!accountHealth) return;
     setRebuilding(true);
@@ -657,9 +676,9 @@ function CollectorHealthPanel({ reloadToken }: { reloadToken: number }) {
         <span>Latest samples</span>
         <strong>{health?.latestTokenSamples.length ?? 0} token · {health?.latestRateLimitSamples.length ?? 0} rate-limit</strong>
       </div>
-      {health && health.accounts.length > 1 ? (
+      {accountHealthSummary ? (
         <p className="muted tiny collector-account-health-list">
-          账号健康：{health.accounts.map((account) => `${account.accountKey}=${account.status}`).join(" · ")}
+          账号健康：{accountHealthSummary}
         </p>
       ) : null}
       {collector?.status !== "running" ? (
@@ -674,8 +693,8 @@ function CollectorHealthPanel({ reloadToken }: { reloadToken: number }) {
       {loadError ? <p className="quota-estimate-warning">无法读取 Collector health：{loadError}</p> : null}
       {rebuildError ? <p className="quota-estimate-warning">账号重建失败：{rebuildError}</p> : null}
       {currentAccountKey && accountHealth && accountHealth.status !== "verified" ? (
-        <button className="secondary-button" aria-label={`重建账号 ${accountHealth.accountKey} 数据`} onClick={() => void rebuild()} disabled={rebuilding}>
-          {rebuilding ? "重建中…" : "通过 Collector 重建账号数据"}
+        <button className="secondary-button" aria-label={`重建账号 ${accountHealth.accountKey} 数据`} onClick={() => void rebuild()} disabled={rebuilding || collectorBusy}>
+          {rebuilding ? "重建中…" : collectorBusy ? "Collector 空闲后可重建" : "通过 Collector 重建账号数据"}
         </button>
       ) : null}
     </section>
@@ -2023,7 +2042,7 @@ function App() {
         />
       ) : null}
 
-      <CollectorHealthPanel reloadToken={analyticsReloadToken} />
+      <CollectorHealthPanel reloadToken={analyticsReloadToken} schedulerStatus={schedulerStatus} />
 
       {/*
        * ======================================================

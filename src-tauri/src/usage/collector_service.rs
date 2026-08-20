@@ -25,7 +25,11 @@ use super::{
 use crate::codex::CodexRpcClient;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+// The official rate-limit endpoint may perform a secondary remote lookup and
+// can legitimately take longer than a few seconds. Keep heartbeat polling at
+// five seconds, but give official refreshes a bounded 30-second cadence so a
+// slow remote service cannot turn into a continuous request storm.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 fn read_account_snapshot(rpc: &Arc<CodexRpcClient>) -> Result<Value, String> {
     rpc.request("account/read", Some(json!({"refreshToken": false})))
@@ -186,6 +190,17 @@ impl StandaloneCollector {
         let mut identity_unavailable = false;
         for path in paths.into_iter().filter(|path| path.is_file()) {
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let source_needs_refresh = {
+                let connection = self
+                    .runtime
+                    .connection
+                    .lock()
+                    .map_err(|_| "collector DB lock poisoned".to_string())?;
+                collector_core::source_needs_refresh(&connection, &path)?
+            };
+            if !source_needs_refresh {
                 continue;
             }
             // Re-read account ownership for every source. A single refresh
@@ -597,6 +612,17 @@ impl StandaloneCollector {
                         .get("accountKey")
                         .and_then(Value::as_str)
                         .ok_or_else(|| "REBUILD_ACCOUNT requires accountKey".to_string())?;
+                    let refresh_in_progress = self
+                        .runtime
+                        .refresh
+                        .lock()
+                        .map_err(|_| "collector refresh lock poisoned".to_string())?
+                        .refreshing;
+                    if refresh_in_progress {
+                        return Err(
+                            "collector refresh is still running; retry after it completes".into(),
+                        );
+                    }
                     let connection = self
                         .runtime
                         .connection
