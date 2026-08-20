@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Local Codex quota and token usage monitor"
 authors = ["you"]
 edition = "2021"
+default-run = "codex-nexus"
 
 [lib]
 name = "codex_nexus_lib"
