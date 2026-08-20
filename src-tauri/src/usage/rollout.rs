@@ -2338,6 +2338,15 @@ pub fn rebuild_account_connection(
     if is_unresolved_account_key(account_key) {
         return Err("unresolved sources cannot be rebuilt as an account".into());
     }
+    // REBUILD_ACCOUNT is an explicit repair request. Mark the current ledger
+    // as rebuilding first so the idempotency guard below cannot silently
+    // accept an already-recorded but inconsistent parser version.
+    set_account_data_health(
+        connection,
+        account_key,
+        DATA_HEALTH_REBUILDING,
+        ROLLOUT_PARSER_VERSION,
+    )?;
     let files = discover_rollout_files_for_account(&connection, None, account_key)?;
     let _ = rebuild_rollout_derived_data(&connection, &files, account_key)?;
     super::quota::rebuild_account_intervals(&connection, account_key)?;

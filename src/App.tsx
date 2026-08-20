@@ -1885,6 +1885,7 @@ function App() {
         retryCountdownMs,
       ],
     );
+  const isCollectorRefreshError = error?.startsWith("Collector refresh failed:") ?? false;
 
   const connectionReady =
     connection?.phase === "ready";
@@ -2173,7 +2174,7 @@ function App() {
               className="error-card"
             >
               <strong>
-                无法读取 Codex
+                {isCollectorRefreshError ? "数据刷新异常" : "无法读取 Codex"}
               </strong>
 
               <p>
